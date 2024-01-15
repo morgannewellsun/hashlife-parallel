@@ -1,7 +1,7 @@
 // #define DEBUG_HASH
 // #define DEBUG_RESULT
 // #define DEBUG_EXPAND
-// #define DEBUG_PROGRESS
+// #define VERBOSE
 #define ENABLE_SLEEP
 
 #include <cmath>
@@ -216,7 +216,7 @@ public:
             half_step *= 2;
         }
         top_quad = initial_state_quad[0][0];
-#ifdef DEBUG_PROGRESS
+#ifdef VERBOSE
         cout << "Construction of initial state representation complete." << endl;
 #endif
     }
@@ -287,6 +287,7 @@ public:
 
     vector<vector<quad*>> expand_result(vector<vector<quad*>> input_grid, tuple<int, int, int, int, int, int> input_step, tuple<int, int, int, int, int, int> output_step) {
         // macrocell size gets cut in half; time increases by half of the output macrocell sidelength
+
         int depth = 1 << (get<1>(output_step) - 1);
         bool shrink_east = get<4>(input_step) != get<4>(output_step) + 2 * depth;
         bool shrink_north = get<3>(input_step) != get<3>(output_step) - 2 * depth;
@@ -294,6 +295,7 @@ public:
         bool shrink_south = get<5>(input_step) != get<5>(output_step) + 2 * depth;
         int output_dims_y = ((input_grid.size() - 1) * 2) - (shrink_north ? 1 : 0) - (shrink_south ? 1 : 0);
         int output_dims_x = ((input_grid[0].size() - 1) * 2) - (shrink_east ? 1 : 0) - (shrink_west ? 1 : 0);
+
         // create a first auxillary grid (one unit wider and taller than the output)
         vector<vector<quad*>> aux_grid(output_dims_y + 1, vector<quad*>(output_dims_x + 1, nullptr));
         bool next_aux_is_combo_y = shrink_north;
@@ -341,6 +343,7 @@ public:
             }
             next_aux_is_combo_y = !next_aux_is_combo_y;
         }
+
         // create a second auxillary grid (same size as the output)
         vector<vector<quad*>> aux_grid_2(output_dims_y, vector<quad*>(output_dims_x, nullptr));
         for (int next_aux_idx_y = 0; next_aux_idx_y < output_dims_y; next_aux_idx_y++) {
@@ -360,22 +363,27 @@ public:
                 output_grid[next_output_idx_y][next_output_idx_x] = get_or_compute_result(aux_grid_2[next_output_idx_y][next_output_idx_x]);
             }
         }
+
         #ifdef DEBUG_EXPAND
             cout << "Expanding using result method. "
                  << "Input grid has height " << input_grid.size() << " and width " << input_grid[0].size() << ". "
                  << "Output grid has height " << output_grid.size() << " and width " << output_grid[0].size() << ". " << endl;
         #endif
+
         return output_grid;
     }
 
     vector<vector<quad*>> expand_static(vector<vector<quad*>> input_grid, tuple<int, int, int, int, int, int> input_step, tuple<int, int, int, int, int, int> output_step) {
         // macrocell size gets cut in half; time remains unchanged
+
         bool shrink_east = get<4>(input_step) != get<4>(output_step);
         bool shrink_north = get<3>(input_step) != get<3>(output_step);
         bool shrink_west = get<2>(input_step) != get<2>(output_step);
         bool shrink_south = get<5>(input_step) != get<5>(output_step);
         int output_dims_y = (input_grid.size() * 2) - (shrink_north ? 1 : 0) - (shrink_south ? 1 : 0);
         int output_dims_x = (input_grid[0].size() * 2) - (shrink_east ? 1 : 0) - (shrink_west ? 1 : 0);
+
+        // construct the output grid using children of the macrocells in the input grid
         vector<vector<quad*>> output_grid(output_dims_y, vector<quad*>(output_dims_x, nullptr));
         bool next_input_child_is_south = shrink_north;
         int next_input_idx_y = 0;
@@ -406,11 +414,13 @@ public:
             }
             next_input_child_is_south = !next_input_child_is_south;
         }
+
         #ifdef DEBUG_EXPAND
             cout << "Expanding using static method. "
                  << "Input grid has height " << input_grid.size() << " and width " << input_grid[0].size() << ". "
                  << "Output grid has height " << output_grid.size() << " and width " << output_grid[0].size() << ". " << endl;
         #endif
+
         return output_grid;
     }
 
@@ -432,10 +442,10 @@ public:
         while (true) {
 
             // stop if:
-            // 1. we are at time zero
-            // 2. we are left with one, two, or four macrocells
-            // 3. all of which have the origin as one of their corners
-            // 4. all of which are at least a quarter of the size of top_quad
+            // 1. we are at time zero AND
+            // 2. we are left with one, two, or four macrocells AND
+            // 3. all of them have the origin as one of their corners AND
+            // 4. all of them are at least a quarter of the size of top_quad
             stop = true;
             if (get<0>(steps.back()) > 0) {
                 stop = false;
@@ -520,8 +530,7 @@ public:
                           << get<2>(step) << ", " 
                           << get<3>(step) << ", " 
                           << get<4>(step) << ", " 
-                          << get<5>(step) 
-                          << ")" << endl;
+                          << get<5>(step) << ")" << endl;
             }
         #endif
 
