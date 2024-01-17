@@ -2,7 +2,6 @@
 // #define DEBUG_RESULT
 // #define DEBUG_EXPAND
 // #define VERBOSE
-#define ENABLE_SLEEP
 
 #include <cmath>
 #include <functional>
@@ -10,9 +9,6 @@
 #include <tuple>
 #include <unordered_map>
 #include <vector>
-#ifdef ENABLE_SLEEP
-    #include <unistd.h>
-#endif
 
 using namespace std;
 
@@ -31,53 +27,64 @@ int round_two(int number, int exponent, bool round_up) {
 }
 
 struct quad {
-    int size; // square macrocell with side lengths 2^size
+    size_t size; // square macrocell with side lengths 2^size
     quad* ne;
     quad* nw;
     quad* sw;
     quad* se;
     quad* result;
+    size_t qhash;
 
-    quad() 
-        : size(0), ne(nullptr), nw(nullptr), sw(nullptr), se(nullptr), result(nullptr) {}
+    quad(size_t content) 
+        : size(0), ne(nullptr), nw(nullptr), sw(nullptr), se(nullptr), result(nullptr), qhash(content) {}
 
     quad(quad* ne, quad* nw, quad* sw, quad* se) 
-        : size(ne->size + 1), ne(ne), nw(nw), sw(sw), se(se), result(nullptr) {}
+        : size(ne->size + 1), ne(ne), nw(nw), sw(sw), se(se), result(nullptr), qhash(0) {
+        hash();
+    }
 
     quad(quad* ne, quad* nw, quad* sw, quad* se, quad* result) 
-        : size(ne->size + 1), ne(ne), nw(nw), sw(sw), se(se), result(result) {}
+        : size(ne->size + 1), ne(ne), nw(nw), sw(sw), se(se), result(result), qhash(0) {
+        hash();
+    }
 
     bool operator==(const quad& other) const {
         return ne == other.ne && nw == other.nw && sw == other.sw && se == other.se;
     }
+
+    void hash();
 };
 
 struct quad_hash {
     // hash function that takes four quad* as input
     size_t operator()(const tuple<quad*, quad*, quad*, quad*>& t) const {
-        size_t h1 = hash<quad*>{}(get<0>(t));
-        size_t h2 = hash<quad*>{}(get<1>(t));
-        size_t h3 = hash<quad*>{}(get<2>(t));
-        size_t h4 = hash<quad*>{}(get<3>(t));
+        size_t h1 = hash<size_t>{}(get<0>(t)->qhash);
+        size_t h2 = hash<size_t>{}(get<1>(t)->qhash);
+        size_t h3 = hash<size_t>{}(get<2>(t)->qhash);
+        size_t h4 = hash<size_t>{}(get<3>(t)->qhash);
         return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3);
     }
 };
 
+void quad::hash() {
+    quad_hash q;
+    qhash = q({ ne, nw, sw, se });
+};
+
 class hashlife {
 public:
-    quad* dead_cell = new quad();
-    quad* live_cell = new quad();
+    quad* dead_cell = new quad(0);
+    quad* live_cell = new quad(1);
     unordered_map<tuple<quad*, quad*, quad*, quad*>, quad*, quad_hash> hashmap;
     quad* top_quad;
     vector<quad*> dead_quads = {dead_cell};
 
-    unordered_map<tuple<quad*, quad*, quad*, quad*>, quad*, quad_hash> initialize_hashmap() {
+    void initialize_hashmap() {
+        // This function should be called only once
+        if (!hashmap.empty()) return;
 
         // enumerate both (1x1) macrocells; these aren't memoized
         quad* quads_1x1[] = {dead_cell, live_cell};
-
-        // create the empty hashmap
-        unordered_map<tuple<quad*, quad*, quad*, quad*>, quad*, quad_hash> hashmap;
 
         // generate and memoize all 16 (2x2) macrocells; they don't have results
         vector<quad*> quads_2x2;
@@ -146,7 +153,6 @@ public:
                 }
             }
         }
-        return hashmap;
     }
 
     quad* get_or_add_quad(quad* ne, quad* nw, quad* sw, quad* se) {
@@ -174,7 +180,7 @@ public:
     hashlife(const vector<vector<bool>>& initial_state) {
 
         // force initial state size to be a power of 2
-        int initial_state_sidelength = initial_state.size();
+        size_t initial_state_sidelength = initial_state.size();
         if (!((initial_state_sidelength) > 0 && ((initial_state_sidelength) & ((initial_state_sidelength) - 1)) == 0)) {
             cout << "Bad input shape." << endl;
             throw;
@@ -187,7 +193,7 @@ public:
         }
 
         // initialize hashmap
-        hashmap = initialize_hashmap();
+        initialize_hashmap();
 #ifdef DEBUG_HASH
         cout << "Hashmap initialization complete." << endl;
 #endif
@@ -269,7 +275,7 @@ public:
         }
     }
 
-    quad* get_dead_quad(int size) {
+    quad* get_dead_quad(size_t size) {
         while (size >= dead_quads.size()) {
             dead_quads.push_back(get_or_add_quad(dead_quads.back(), dead_quads.back(), dead_quads.back(), dead_quads.back()));
         }
@@ -293,8 +299,8 @@ public:
         bool shrink_north = get<3>(input_step) != get<3>(output_step) - 2 * depth;
         bool shrink_west = get<2>(input_step) != get<2>(output_step) - 2 * depth;
         bool shrink_south = get<5>(input_step) != get<5>(output_step) + 2 * depth;
-        int output_dims_y = ((input_grid.size() - 1) * 2) - (shrink_north ? 1 : 0) - (shrink_south ? 1 : 0);
-        int output_dims_x = ((input_grid[0].size() - 1) * 2) - (shrink_east ? 1 : 0) - (shrink_west ? 1 : 0);
+        size_t output_dims_y = ((input_grid.size() - 1) * 2) - (shrink_north ? 1 : 0) - (shrink_south ? 1 : 0);
+        size_t output_dims_x = ((input_grid[0].size() - 1) * 2) - (shrink_east ? 1 : 0) - (shrink_west ? 1 : 0);
 
         // create a first auxillary grid (one unit wider and taller than the output)
         vector<vector<quad*>> aux_grid(output_dims_y + 1, vector<quad*>(output_dims_x + 1, nullptr));
@@ -380,8 +386,8 @@ public:
         bool shrink_north = get<3>(input_step) != get<3>(output_step);
         bool shrink_west = get<2>(input_step) != get<2>(output_step);
         bool shrink_south = get<5>(input_step) != get<5>(output_step);
-        int output_dims_y = (input_grid.size() * 2) - (shrink_north ? 1 : 0) - (shrink_south ? 1 : 0);
-        int output_dims_x = (input_grid[0].size() * 2) - (shrink_east ? 1 : 0) - (shrink_west ? 1 : 0);
+        size_t output_dims_y = (input_grid.size() * 2) - (shrink_north ? 1 : 0) - (shrink_south ? 1 : 0);
+        size_t output_dims_x = (input_grid[0].size() * 2) - (shrink_east ? 1 : 0) - (shrink_west ? 1 : 0);
 
         // construct the output grid using children of the macrocells in the input grid
         vector<vector<quad*>> output_grid(output_dims_y, vector<quad*>(output_dims_x, nullptr));
@@ -568,7 +574,7 @@ public:
         }
 
         // perform the steps that we planned out, from the back of the vector to the front
-        for (int i = steps.size() - 1; i > 0; i--) {
+        for (size_t i = steps.size() - 1; i > 0; i--) {
             if (get<0>(steps[i]) != get<0>(steps[i-1])) {
                 result = expand_result(result, steps[i], steps[i-1]);
             } else {
@@ -615,7 +621,7 @@ public:
         auto nw_grid = expand_quad(input->nw);
         auto sw_grid = expand_quad(input->sw);
         auto se_grid = expand_quad(input->se);
-        int half_size = ne_grid.size();
+        size_t half_size = ne_grid.size();
         vector<vector<bool>> result(2 * half_size, vector<bool>(2 * half_size));
         for (int i = 0; i < half_size; ++i) {
             for (int j = 0; j < half_size; ++j) {
@@ -699,10 +705,19 @@ int main() {
     // hashlife::print_grid(my_hashlife.expand_quad(my_result));
 
     // render some viewports
-    for (int i = 0; i < 2000; i++) {
-        hashlife::print_grid(my_hashlife.show_viewport(i, -51, -28, 52, 29));
-        usleep(50000);
+    int cnt = 0;
+    size_t old = 0;
+    for (int i = 0; i < 2200; i++) {
+        true? my_hashlife.show_viewport(i, -51, -28, 52, 29) : hashlife::print_grid(my_hashlife.show_viewport(i, -51, -28, 52, 29));
+        if (my_hashlife.top_quad->qhash == old) {
+            ++cnt;
+        }
+        else {
+            old = my_hashlife.top_quad->qhash;
+            std::cout << old << " appeared " << cnt << " times." << std::endl;
+            cnt = 1;
+        }
     }
-
+    std::cout << old << " appeared " << cnt << " times." << std::endl;
     return 0;
 }
