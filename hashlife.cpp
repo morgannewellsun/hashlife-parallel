@@ -2,10 +2,11 @@
 // #define DEBUG_RESULT
 // #define DEBUG_EXPAND
 // #define VERBOSE
-// #define ENABLE_SLEEP
+#define ENABLE_SLEEP
 
+#include <chrono>
 #include <cmath>
-#include <functional>
+#include <ctime>
 #include <iostream>
 #include <tuple>
 #include <unordered_map>
@@ -436,7 +437,7 @@ public:
         return output_grid;
     }
 
-    vector<vector<bool>> show_viewport(int time, int x_min, int y_min, int x_max, int y_max) {
+    vector<vector<bool>>* show_viewport(int time, int x_min, int y_min, int x_max, int y_max) {
         
         // decompose the problem into a vector of intermediate steps, each of which is a grid of macrocells that must be found
         vector<tuple<int, int, int, int, int, int>> steps;  // [time, size, x_min, y_min, x_max, y_max]
@@ -589,10 +590,10 @@ public:
         }
 
         // convert result to a grid of booleans
-        vector<vector<bool>> result_bool(result.size(), vector<bool>(result[0].size()));
+        vector<vector<bool>>* result_bool = new vector<vector<bool>>(result.size(), vector<bool>(result[0].size()));
         for (int i = 0; i < result.size(); ++i) {
             for (int j = 0; j < result[i].size(); ++j) {
-                result_bool[i][j] = result[i][j] == live_cell;
+                (*result_bool)[i][j] = result[i][j] == live_cell;
             }
         }
         return result_bool;
@@ -657,7 +658,7 @@ public:
 int main() {
 
     // empty grid
-    int initial_state_sidelength = 16;
+    int initial_state_sidelength = 256;
     int middle = initial_state_sidelength / 2;
     vector<vector<bool>> initial_state(initial_state_sidelength, vector<bool>(initial_state_sidelength, false));
 
@@ -685,36 +686,61 @@ int main() {
     // initial_state[middle + 1][middle - 1] = true;
     // initial_state[middle + 2][middle    ] = true;
     // initial_state[middle + 2][middle + 3] = true; 
+    
+    // 20-cell quadratic growth
+    initial_state[middle + 32][middle     ] = true;
+    initial_state[middle + 30][middle +  1] = true;
+    initial_state[middle + 31][middle +  1] = true;
+    initial_state[middle + 29][middle +  2] = true;
+    initial_state[middle + 32][middle +  2] = true;
+    initial_state[middle + 28][middle +  3] = true;
+    initial_state[middle + 28][middle +  5] = true;
+    initial_state[middle + 28][middle +  6] = true;
+    initial_state[middle + 29][middle +  6] = true;
+    initial_state[middle +  8][middle + 88] = true;
+    initial_state[middle +  8][middle + 89] = true;
+    initial_state[middle +  8][middle + 90] = true;
+    initial_state[middle +  1][middle + 92] = true;
+    initial_state[middle +  0][middle + 94] = true;
+    initial_state[middle +  1][middle + 94] = true;
+    initial_state[middle +  2][middle + 94] = true;
+    initial_state[middle +  2][middle + 95] = true;
+    initial_state[middle + 20][middle + 95] = true;
+    initial_state[middle + 19][middle + 96] = true;
+    initial_state[middle + 20][middle + 96] = true;
 
     // initialization
     hashlife my_hashlife(initial_state);
 
-    // // print stuff
-    // cout << "Number of items in hashmap: " << my_hashlife.hashmap.size() << endl;
-    // if (my_hashlife.verify_hashmap(my_hashlife.top_quad)) {
-    //     cout << "Hashmap validation passed." << endl;
-    // } else {
-    //     cout << "Hashmap validation failed." << endl;
-    // }
-    // hashlife::print_grid(my_hashlife.expand_quad(my_hashlife.top_quad));
-
-    // // computing a result
-    // quad* my_result = my_hashlife.get_or_compute_result(my_hashlife.top_quad);
-
-    // // print stuff
-    // cout << "Number of items in hashmap: " << my_hashlife.hashmap.size() << endl; 
-    // if (my_hashlife.verify_hashmap(my_hashlife.top_quad)) {
-    //     cout << "Hashmap validation passed." << endl;
-    // } else {
-    //     cout << "Hashmap validation failed." << endl;
-    // }
-    // hashlife::print_grid(my_hashlife.expand_quad(my_result));
+    // viewport parameters
+    int n_timesteps = 200000;
+    int x_padding = 96;
+    int y_padding = 19;
+    int x_min = 0 - x_padding;
+    int y_min = 0 - y_padding;
+    int x_max = 97 + x_padding;
+    int y_max = 33 + y_padding;
 
     // render some viewports
-    for (int i = 0; i < 20000; i++) {
-        // hashlife::print_grid(my_hashlife.show_viewport(i, -51, -28, 52, 29));
-        // usleep(50000);
-        my_hashlife.show_viewport(i, -51, -28, 52, 29);
+    vector<vector<vector<bool>>*> viewports(n_timesteps, nullptr); 
+    auto start = std::chrono::system_clock::now();
+    for (int curr_timestep = 0; curr_timestep < n_timesteps; curr_timestep++) {
+        viewports[curr_timestep] = my_hashlife.show_viewport(curr_timestep, x_min, y_min, x_max, y_max);
+    }
+    auto end = std::chrono::system_clock::now();
+    std::chrono::duration<double> elapsed_seconds = end - start;
+    std::cout << "Computation took " << elapsed_seconds.count() << " seconds." << std::endl;
+#ifdef ENABLE_SLEEP
+    usleep(5000000);
+#endif
+
+    // show the viewports
+    for (int i = 0; i < n_timesteps; ++i) {
+        hashlife::print_grid(*viewports[i]);
+        delete viewports[i];
+#ifdef ENABLE_SLEEP
+        usleep(50000);
+#endif
     }
 
     return 0;

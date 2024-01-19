@@ -7,9 +7,9 @@
 // #define VERBOSE
 #define ENABLE_SLEEP
 
+#include <chrono>
 #include <cmath>
-#include <forward_list>
-#include <functional>
+#include <ctime>
 #include <iostream>
 #include <tuple>
 #include <unordered_map>
@@ -874,7 +874,7 @@ int main() {
     hashlife my_hashlife(initial_state, log_n_shards);
 
     // viewport parameters
-    int n_timesteps = 2000;
+    int n_timesteps = 200000;
     int x_padding = 96;
     int y_padding = 19;
     int x_min = 0 - x_padding;
@@ -884,6 +884,7 @@ int main() {
 
     // render some viewports
     vector<vector<vector<bool>>*> viewports(n_timesteps, nullptr); 
+    auto start = std::chrono::system_clock::now();
     int next_timestep = 0;
     while (true) {
 
@@ -929,11 +930,12 @@ int main() {
         // do a rehash (since that's the only other reason we could have exited the parallel block)
         my_hashlife.rehash(n_threads);
     }
-
-    // // serial implementation
-    // for (int i = 0; i < n_timesteps; ++i) {
-    //     viewports[i] = my_hashlife.show_viewport(i, -51, -28, 52, 29);
-    // }
+    auto end = std::chrono::system_clock::now();
+    std::chrono::duration<double> elapsed_seconds = end - start;
+    std::cout << "Computation took " << elapsed_seconds.count() << " seconds." << std::endl;
+#ifdef ENABLE_SLEEP
+    usleep(5000000);
+#endif
 
     // show the viewports
     for (int i = 0; i < n_timesteps; ++i) {
