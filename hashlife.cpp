@@ -6,7 +6,6 @@
 #include <ctime>
 #include <iostream>
 #include <tuple>
-#include <unordered_map>
 #include <vector>
 
 #ifdef ENABLE_VISUAL
