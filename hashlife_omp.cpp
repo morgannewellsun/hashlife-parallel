@@ -829,13 +829,12 @@ int main() {
 
     // parameters
     int log_n_threads = 2;  // 32 threads maximum
-    int log_n_shards = 15;
-    int chunk_size = 20;
+    int log_n_shards = 12;
 
     // initialization
     int n_threads = 1 << log_n_threads;
     int n_shards = 1 << log_n_shards;
-    cout << "Using " << n_threads << " threads, " << n_shards << " shards, and a chunk size of " << chunk_size << "." << endl;
+    cout << "Using " << n_threads << " threads and " << n_shards << " shards." << endl;
     hashlife my_hashlife(initial_state, log_n_shards);
 
     // viewport parameters
@@ -877,18 +876,13 @@ int main() {
                     } else {
                         done = false;
                         curr_timestep = next_timestep;
-                        next_timestep += chunk_size;
+                        next_timestep++;
                     }
                 }
                 if (done) {
                     break;
                 } else {
-                    for (offset = 0; offset < chunk_size; offset++) {
-                        if (curr_timestep + offset >= n_timesteps) {
-                            break;
-                        }
-                        viewports[curr_timestep + offset] = my_hashlife.show_viewport(curr_timestep + offset, x_min, y_min, x_max, y_max);
-                    }
+                    viewports[curr_timestep] = my_hashlife.show_viewport(curr_timestep, x_min, y_min, x_max, y_max);
                 }
             }
         }
@@ -899,6 +893,7 @@ int main() {
         }
 
         // do a rehash (since that's the only other reason we could have exited the parallel block)
+        cout << "Rehashing." << endl;
         my_hashlife.rehash(n_threads);
     }
 
