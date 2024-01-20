@@ -1,11 +1,5 @@
 #define IS_POWER_OF_TWO(x) ((x) > 0 && ((x) & ((x) - 1)) == 0)
-
-// #define DEBUG_HASH
-#define DEBUG_REHASH
-// #define DEBUG_RESULT
-// #define DEBUG_EXPAND
-// #define VERBOSE
-#define ENABLE_SLEEP
+// #define ENABLE_VISUAL
 
 #include <chrono>
 #include <cmath>
@@ -17,7 +11,7 @@
 
 #include "omp.h"
 
-#ifdef ENABLE_SLEEP
+#ifdef ENABLE_VISUAL
 #include <unistd.h>
 #endif
 
@@ -110,7 +104,7 @@ public:
         this->log_n_shards = log_n_shards;
         n_shards = 1 << log_n_shards;
         log_shard_capacity = log_capacity - log_n_shards;
-        rehash_threshold = 7 * (1 << log_shard_capacity) / 10;
+        rehash_threshold = 1 << (log_shard_capacity - 1);
 
         rehash_needed = false;
         buckets = new tuple<quad*, quad*, quad*, quad*, quad*, size_t>*[capacity]();
@@ -119,23 +113,16 @@ public:
         for(int i = 0; i < n_shards; i++) {
             omp_init_lock(&shard_locks[i]);
         }
-
-#ifdef DEBUG_HASH
-        cout << "Made a concurrent_hashmap with capacity " << capacity << " split across " << n_shards << " shards." << endl;
-#endif
     }
 
     ~concurrent_hashmap() {
-
         // tuples are reused in the rehashed hashmap, so don't delete them
         // this probably violates some programming principles regarding memory management
-    
         // for (int i = 0; i < capacity; ++i) {
         //     if (buckets[i] != nullptr) {
         //         delete buckets[i];
         //     }
         // }
-
         delete[] buckets;
         for (int i = 0; i < n_shards; i++) {
             omp_destroy_lock(&shard_locks[i]);
@@ -152,12 +139,13 @@ public:
 
     quad* get_or_construct(quad* ne, quad* nw, quad* sw, quad* se) {
         size_t hash_value = quad_hash(ne, nw, sw, se);
-        int bucket_index = hash_value % capacity;
+        int bucket_index = hash_value % capacity;  // hash_value & (capacity - 1);
+        int first_bucket_index = bucket_index;
         int shard_index = bucket_to_shard_index(bucket_index);
         int new_shard_index;
         quad* ptr_to_return;
         omp_set_lock(&shard_locks[shard_index]);
-        while (true) {
+        for(;;) {
             if (buckets[bucket_index] == nullptr) {
                 // key not found; construct and insert a new quad
                 ptr_to_return = new quad(ne, nw, sw, se);
@@ -167,9 +155,6 @@ public:
                     #pragma omp atomic write
                     rehash_needed = true;
                 }
-#ifdef DEBUG_HASH
-                cout << "Constructed and inserted a new item into index " << bucket_index << ", located in shard " << shard_index << " (now has " << shard_sizes[shard_index] << " items)" << endl;
-#endif
                 break;
             } else if (get<0>(*buckets[bucket_index]) == ne && 
                        get<1>(*buckets[bucket_index]) == nw && 
@@ -177,13 +162,14 @@ public:
                        get<3>(*buckets[bucket_index]) == se) {
                 // found our key; return the corresponding quad
                 ptr_to_return = get<4>(*buckets[bucket_index]);
-#ifdef DEBUG_HASH
-                cout << "Item already exists in index " << bucket_index << ", located in shard " << shard_index << endl;
-#endif
                 break;
             } else {
                 // hash collision; continue linearly probing, switching locks if necessary
-                bucket_index = (bucket_index + 1) % capacity;
+                bucket_index = (bucket_index + 1) % capacity;  // (bucket_index + 1) & (capacity - 1);
+                if (bucket_index == first_bucket_index) {
+                    cout << "Attempted to construct and insert a new item, but all hashmap shards were full. This is fatal."  << endl;
+                    throw;
+                }
                 new_shard_index = bucket_to_shard_index(bucket_index);
                 if (shard_index != new_shard_index) {
                     omp_unset_lock(&shard_locks[shard_index]);
@@ -201,10 +187,7 @@ public:
         // caller is responsible for managing deletion of both the old and new hashmap
         // caller is responsible for ensuring that this is called when no writes to the old hashmap are active
         concurrent_hashmap* new_hashmap = new concurrent_hashmap(old_hashmap->log_capacity + 1, old_hashmap->log_n_shards);
-#ifdef DEBUG_REHASH
-        cout << "Rehashing to a new hashmap with capacity " << (1 << (new_hashmap->log_capacity)) << " split across " << (1 << old_hashmap->log_n_shards) << " shards." << endl;
-#endif
-        #pragma omp parallel for
+        #pragma omp parallel for num_threads(n_threads)
         for (int i = 0; i < old_hashmap->capacity; ++i) {
             if (old_hashmap->buckets[i] != nullptr) {
                 new_hashmap->rehash_insert(old_hashmap->buckets[i]);
@@ -213,14 +196,30 @@ public:
         return new_hashmap;
     }
 
+    // int test() {
+    //     int blah = 0;
+    //     for (int i = 0; i < capacity; i++) {
+    //         if (buckets[i] != nullptr) {
+    //             int test1 = get<0>(*buckets[i])->log_size;
+    //             int test2 = get<1>(*buckets[i])->log_size;
+    //             int test3 = get<2>(*buckets[i])->log_size;
+    //             int test4 = get<3>(*buckets[i])->log_size;
+    //             int test5 = get<4>(*buckets[i])->log_size;
+    //             blah ^= test1 ^ test2 ^ test3 ^ test4 ^ test5;
+    //         }
+    //     }
+    //     return blah;
+    // }
+
 private:
     void rehash_insert(tuple<quad*, quad*, quad*, quad*, quad*, size_t>* item) {
         size_t hash_value = get<5>(*item);
-        int bucket_index = hash_value % capacity;
+        int bucket_index = hash_value % capacity;  // hash_value & (capacity - 1);
+        int first_bucket_index = bucket_index;
         int shard_index = bucket_to_shard_index(bucket_index);
         int new_shard_index;
         omp_set_lock(&shard_locks[shard_index]);
-        while (true) {
+        for(;;) {
             if (buckets[bucket_index] == nullptr) {
                 // key not found; insert the provided quad
                 buckets[bucket_index] = item;
@@ -229,10 +228,6 @@ private:
                     #pragma omp atomic write
                     rehash_needed = true;
                 }
-#ifdef DEBUG_HASH
-                cout << "During rehashing, inserted an item into index " << bucket_index << ", located in shard " << shard_index << endl;
-                cout << "Shard " << shard_index << " now has " << shard_sizes[shard_index] << " items." << endl;
-#endif
                 break;
             } else if (get<0>(*buckets[bucket_index]) == get<0>(*item) && 
                        get<1>(*buckets[bucket_index]) == get<1>(*item) && 
@@ -243,7 +238,11 @@ private:
                 throw;
             } else {
                 // hash collision; continue linearly probing, switching locks if necessary
-                bucket_index = (bucket_index + 1) % capacity;
+                bucket_index = (bucket_index + 1) % capacity; // (bucket_index + 1) % capacity;
+                if (bucket_index == first_bucket_index) {
+                    cout << "During rehashing, attempted to insert an item, but all hashmap shards were full. This is fatal."  << endl;
+                    throw;
+                }
                 new_shard_index = bucket_to_shard_index(bucket_index);
                 if (shard_index != new_shard_index) {
                     omp_unset_lock(&shard_locks[shard_index]);
@@ -363,9 +362,6 @@ public:
 
         // initialize hashmap
         initialize_hashmap(log_n_shards);
-#ifdef DEBUG_HASH
-        cout << "Hashmap initialization complete." << endl;
-#endif
 
         // convert grid of bools to grid of (1x1) quads
         vector<vector<quad*>> initial_state_quad(initial_state_sidelength, vector<quad*>(initial_state_sidelength, nullptr));
@@ -391,9 +387,6 @@ public:
             half_step *= 2;
         }
         top_quad = initial_state_quad[0][0];
-#ifdef VERBOSE
-        cout << "Construction of initial state representation complete." << endl;
-#endif
     }
 
     hashlife(hashlife&&) = delete;
@@ -401,14 +394,8 @@ public:
 
     quad* get_or_compute_result(quad* input) {
         if (input->result != nullptr) {
-#ifdef DEBUG_RESULT
-            cout << "Result already available for quad of size " << input->size << "." << endl;
-#endif
             return input->result;
         } else {
-#ifdef DEBUG_RESULT
-            cout << "Computing result for quad of size " << input->size << "." << endl;
-#endif
             
             // construct 5 auxillary quads
             quad* aux_n = hashmap->get_or_construct(input->ne->nw, input->nw->ne, input->nw->se, input->ne->sw);
@@ -541,13 +528,6 @@ public:
                 output_grid[next_output_idx_y][next_output_idx_x] = get_or_compute_result(aux_grid_2[next_output_idx_y][next_output_idx_x]);
             }
         }
-
-#ifdef DEBUG_EXPAND
-            cout << "Expanding using result method. "
-                 << "Input grid has height " << input_grid.size() << " and width " << input_grid[0].size() << ". "
-                 << "Output grid has height " << output_grid.size() << " and width " << output_grid[0].size() << ". " << endl;
-#endif
-
         return output_grid;
     }
 
@@ -592,13 +572,6 @@ public:
             }
             next_input_child_is_south = !next_input_child_is_south;
         }
-
-#ifdef DEBUG_EXPAND
-            cout << "Expanding using static method. "
-                 << "Input grid has height " << input_grid.size() << " and width " << input_grid[0].size() << ". "
-                 << "Output grid has height " << output_grid.size() << " and width " << output_grid[0].size() << ". " << endl;
-#endif
-
         return output_grid;
     }
 
@@ -617,7 +590,7 @@ public:
         int next_size;
         int desired_depth;
         int depth;
-        while (true) {
+        for(;;) {
 
             // stop if:
             // 1. we are at time zero AND
@@ -699,18 +672,6 @@ public:
                     round_two(get<5>(steps.back()), next_size, true)});
             }
         }
-
-#ifdef DEBUG_EXPAND
-            for (const auto& step : steps) {
-                cout << "(" 
-                          << get<0>(step) << ", " 
-                          << get<1>(step) << ", " 
-                          << get<2>(step) << ", " 
-                          << get<3>(step) << ", " 
-                          << get<4>(step) << ", " 
-                          << get<5>(step) << ")" << endl;
-            }
-#endif
 
         // ensure our top quad is large enough to proceed and apply padding if not
         while (get<1>(steps.back()) > top_quad->log_size - 1) {
@@ -867,10 +828,15 @@ int main() {
     initial_state[middle + 19][middle + 96] = true;
     initial_state[middle + 20][middle + 96] = true;
 
+    // parameters
+    int log_n_threads = 2;  // 32 threads maximum
+    int log_n_shards = 15;
+    int chunk_size = 20;
+
     // initialization
-    int log_n_threads = 5;  // 32 threads
     int n_threads = 1 << log_n_threads;
-    int log_n_shards = log_n_threads + 1;
+    int n_shards = 1 << log_n_shards;
+    cout << "Using " << n_threads << " threads, " << n_shards << " shards, and a chunk size of " << chunk_size << "." << endl;
     hashlife my_hashlife(initial_state, log_n_shards);
 
     // viewport parameters
@@ -886,15 +852,16 @@ int main() {
     vector<vector<vector<bool>>*> viewports(n_timesteps, nullptr); 
     auto start = std::chrono::system_clock::now();
     int next_timestep = 0;
-    while (true) {
+    for(;;) {
 
         // do computation in parallel until we finish or need a rehash
-        #pragma omp parallel num_threads(n_threads) 
+        #pragma omp parallel num_threads(n_threads)
         {
             int curr_timestep;
             bool rehash_needed;
             bool done;
-            while (true) {
+            int offset;
+            for(;;) {
 
                 // pause the computation if we need to run a rehash
                 #pragma omp atomic read
@@ -906,19 +873,24 @@ int main() {
                 // stop the computation if we've finished all viewports, otherwise, do another viewport
                 #pragma omp critical
                 {
-                    if (next_timestep == n_timesteps) {
+                    if (next_timestep >= n_timesteps) {
                         done = true;
                     } else {
+                        done = false;
                         curr_timestep = next_timestep;
-                        next_timestep++;
+                        next_timestep += chunk_size;
                     }
                 }
                 if (done) {
                     break;
                 } else {
-                    viewports[curr_timestep] = my_hashlife.show_viewport(curr_timestep, x_min, y_min, x_max, y_max);
+                    for (offset = 0; offset < chunk_size; offset++) {
+                        if (curr_timestep + offset >= n_timesteps) {
+                            break;
+                        }
+                        viewports[curr_timestep + offset] = my_hashlife.show_viewport(curr_timestep + offset, x_min, y_min, x_max, y_max);
+                    }
                 }
-
             }
         }
 
@@ -930,21 +902,19 @@ int main() {
         // do a rehash (since that's the only other reason we could have exited the parallel block)
         my_hashlife.rehash(n_threads);
     }
+
     auto end = std::chrono::system_clock::now();
     std::chrono::duration<double> elapsed_seconds = end - start;
     std::cout << "Computation took " << elapsed_seconds.count() << " seconds." << std::endl;
-#ifdef ENABLE_SLEEP
-    usleep(5000000);
-#endif
 
-    // show the viewports
+#ifdef ENABLE_VISUAL
+    usleep(5000000);
     for (int i = 0; i < n_timesteps; ++i) {
         hashlife::print_grid(*viewports[i]);
         delete viewports[i];
-#ifdef ENABLE_SLEEP
         usleep(50000);
-#endif
     }
+#endif
 
     return 0;
 

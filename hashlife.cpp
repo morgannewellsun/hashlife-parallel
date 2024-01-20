@@ -1,8 +1,5 @@
-// #define DEBUG_HASH
-// #define DEBUG_RESULT
-// #define DEBUG_EXPAND
-// #define VERBOSE
-#define ENABLE_SLEEP
+#define IS_POWER_OF_TWO(x) ((x) > 0 && ((x) & ((x) - 1)) == 0)
+// #define ENABLE_VISUAL
 
 #include <chrono>
 #include <cmath>
@@ -11,13 +8,15 @@
 #include <tuple>
 #include <unordered_map>
 #include <vector>
-#ifdef ENABLE_SLEEP
+
+#ifdef ENABLE_VISUAL
 #include <unistd.h>
 #endif
 
 using namespace std;
 
 int round_two(int number, int exponent, bool round_up) {
+    // round number up or down to the nearest 2^exponent
     int power_of_two = 1 << exponent;
     if (number < 0) {
         round_up = !round_up;
@@ -32,7 +31,7 @@ int round_two(int number, int exponent, bool round_up) {
 }
 
 struct quad {
-    int size; // square macrocell with side lengths 2^size
+    int log_size; // square macrocell with side lengths 2^size
     quad* ne;
     quad* nw;
     quad* sw;
@@ -40,13 +39,10 @@ struct quad {
     quad* result;
 
     quad() 
-        : size(0), ne(nullptr), nw(nullptr), sw(nullptr), se(nullptr), result(nullptr) {}
+        : log_size(0), ne(nullptr), nw(nullptr), sw(nullptr), se(nullptr), result(nullptr) {}
 
     quad(quad* ne, quad* nw, quad* sw, quad* se) 
-        : size(ne->size + 1), ne(ne), nw(nw), sw(sw), se(se), result(nullptr) {}
-
-    quad(quad* ne, quad* nw, quad* sw, quad* se, quad* result) 
-        : size(ne->size + 1), ne(ne), nw(nw), sw(sw), se(se), result(result) {}
+        : log_size(ne->log_size + 1), ne(ne), nw(nw), sw(sw), se(se), result(nullptr) {}
 
     bool operator==(const quad& other) const {
         return ne == other.ne && nw == other.nw && sw == other.sw && se == other.se;
@@ -63,32 +59,150 @@ size_t custom_hash(quad* ptr) {
     return h;
 }
 
-struct quad_hash {
-    // hash function that takes four quad* as input
-    size_t operator()(const tuple<quad*, quad*, quad*, quad*>& t) const {
-        size_t h1 = custom_hash(get<0>(t));
-        size_t h2 = custom_hash(get<1>(t));
-        size_t h3 = custom_hash(get<2>(t));
-        size_t h4 = custom_hash(get<3>(t));
-        return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3);
+size_t quad_hash(quad* ne, quad* nw, quad* sw, quad* se) {
+    size_t h1 = custom_hash(ne);
+    size_t h2 = custom_hash(nw);
+    size_t h3 = custom_hash(sw);
+    size_t h4 = custom_hash(se);
+    return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3);
+}
+
+class serial_hashmap {
+public:
+
+    // constants
+    int log_capacity;
+    int capacity;
+    int rehash_threshold;
+
+    int size;
+    bool rehash_needed;
+    tuple<quad*, quad*, quad*, quad*, quad*, size_t>** buckets;
+
+    serial_hashmap(int log_capacity) {
+
+        this->log_capacity = log_capacity;
+        capacity = 1 << log_capacity;
+        rehash_threshold = 1 << (log_capacity - 1);
+
+        size = 0;
+        rehash_needed = false;
+        buckets = new tuple<quad*, quad*, quad*, quad*, quad*, size_t>*[capacity]();
+    }
+
+    ~serial_hashmap() {
+        // tuples are reused in the rehashed hashmap, so don't delete them
+        // this probably violates some programming principles regarding memory management
+        // for (int i = 0; i < capacity; ++i) {
+        //     if (buckets[i] != nullptr) {
+        //         delete buckets[i];
+        //     }
+        // }
+        delete[] buckets;
+    }
+
+    serial_hashmap(serial_hashmap&&) = delete;
+    serial_hashmap& operator=(serial_hashmap&&) = delete;
+
+    quad* get_or_construct(quad* ne, quad* nw, quad* sw, quad* se) {
+        size_t hash_value = quad_hash(ne, nw, sw, se);
+        int bucket_index = hash_value % capacity;  // hash_value & (capacity - 1);
+        int first_bucket_index = bucket_index;
+        quad* ptr_to_return;
+        for(;;) {
+            if (buckets[bucket_index] == nullptr) {
+                // key not found; construct and insert a new quad
+                ptr_to_return = new quad(ne, nw, sw, se);
+                buckets[bucket_index] = new tuple<quad*, quad*, quad*, quad*, quad*, size_t>(ne, nw, sw, se, ptr_to_return, hash_value);
+                size++;
+                if (size >= rehash_threshold) {
+                    rehash_needed = true;
+                }
+                break;
+            } else if (get<0>(*buckets[bucket_index]) == ne && 
+                       get<1>(*buckets[bucket_index]) == nw && 
+                       get<2>(*buckets[bucket_index]) == sw && 
+                       get<3>(*buckets[bucket_index]) == se) {
+                // found our key; return the corresponding quad
+                ptr_to_return = get<4>(*buckets[bucket_index]);
+                break;
+            } else {
+                // hash collision; continue linearly probing, switching locks if necessary
+                bucket_index = (bucket_index + 1) % capacity;  // (bucket_index + 1) % capacity;
+                if (bucket_index == first_bucket_index) {
+                    cout << "Attempted to construct and insert a new item, but all hashmap shards were full. This is fatal."  << endl;
+                    throw;
+                }
+            }
+        }
+        return ptr_to_return;
+    }
+
+    static serial_hashmap* rehash(serial_hashmap* old_hashmap) {
+        // constructs a rehashed version the old hashmap
+        // caller is responsible for managing deletion of both the old and new hashmap
+        serial_hashmap* new_hashmap = new serial_hashmap(old_hashmap->log_capacity + 1);
+        for (int i = 0; i < old_hashmap->capacity; ++i) {
+            if (old_hashmap->buckets[i] != nullptr) {
+                new_hashmap->rehash_insert(old_hashmap->buckets[i]);
+            }
+        }
+        return new_hashmap;
+    }
+
+private:
+    void rehash_insert(tuple<quad*, quad*, quad*, quad*, quad*, size_t>* item) {
+        size_t hash_value = get<5>(*item);
+        int bucket_index = hash_value % capacity;  // hash_value & (capacity - 1);
+        int first_bucket_index = bucket_index;
+        for(;;) {
+            if (buckets[bucket_index] == nullptr) {
+                // key not found; insert the provided quad
+                buckets[bucket_index] = item;
+                size++;
+                if (size >= rehash_threshold) {
+                    rehash_needed = true;
+                }
+                break;
+            } else if (get<0>(*buckets[bucket_index]) == get<0>(*item) && 
+                       get<1>(*buckets[bucket_index]) == get<1>(*item) && 
+                       get<2>(*buckets[bucket_index]) == get<2>(*item) && 
+                       get<3>(*buckets[bucket_index]) == get<3>(*item)) {
+                // found our key; this is an error
+                cout << "Tried to insert a duplicate key using concurrent_hashmap::insert()." << endl;
+                throw;
+            } else {
+                // hash collision; continue linearly probing, switching locks if necessary
+                bucket_index = (bucket_index + 1) % capacity;  // (bucket_index + 1) % capacity;
+                if (bucket_index == first_bucket_index) {
+                    cout << "Attempted to construct and insert a new item, but all hashmap shards were full. This is fatal."  << endl;
+                    throw;
+                }
+            }
+        }
     }
 };
 
 class hashlife {
 public:
+    bool initialized = false;
     quad* dead_cell = new quad();
     quad* live_cell = new quad();
-    unordered_map<tuple<quad*, quad*, quad*, quad*>, quad*, quad_hash> hashmap;
+    serial_hashmap* hashmap;
     quad* top_quad;
     vector<quad*> dead_quads = {dead_cell};
 
     void initialize_hashmap() {
 
         // this function should be called only once
-        if (!hashmap.empty()) {
+        if (initialized) {
             cout << "Hashmap cannot be initialized more than once." << endl;
             throw;
         }
+        initialized = true;
+
+        // create the hashmap
+        hashmap = new serial_hashmap(18);
 
         // enumerate both (1x1) macrocells; these aren't memoized
         quad* quads_1x1[] = {dead_cell, live_cell};
@@ -101,9 +215,7 @@ public:
             for (int nw_idx = 0; nw_idx < 2; nw_idx++) {
                 for (int sw_idx = 0; sw_idx < 2; sw_idx++) {
                     for (int se_idx = 0; se_idx < 2; se_idx++) {
-                        next_key = make_tuple(quads_1x1[ne_idx], quads_1x1[nw_idx], quads_1x1[sw_idx], quads_1x1[se_idx]);
-                        next_quad = new quad(quads_1x1[ne_idx], quads_1x1[nw_idx], quads_1x1[sw_idx], quads_1x1[se_idx]);
-                        hashmap[next_key] = next_quad;
+                        next_quad = hashmap->get_or_construct(quads_1x1[ne_idx], quads_1x1[nw_idx], quads_1x1[sw_idx], quads_1x1[se_idx]);
                         quads_2x2.push_back(next_quad);
                     }
                 }
@@ -150,37 +262,14 @@ public:
                         results_nw = (results_nw_neighbors == 3 || (results_nw_neighbors == 2 && quads_2x2[nw_idx]->se == quads_1x1[1])) ? quads_1x1[1] : quads_1x1[0];
                         results_sw = (results_sw_neighbors == 3 || (results_sw_neighbors == 2 && quads_2x2[sw_idx]->ne == quads_1x1[1])) ? quads_1x1[1] : quads_1x1[0];
                         results_se = (results_se_neighbors == 3 || (results_se_neighbors == 2 && quads_2x2[se_idx]->nw == quads_1x1[1])) ? quads_1x1[1] : quads_1x1[0];
-                        next_results = hashmap[make_tuple(results_ne, results_nw, results_sw, results_se)];
+                        next_results = hashmap->get_or_construct(results_ne, results_nw, results_sw, results_se);
                         
                         // store in hashmap
-                        next_key = make_tuple(quads_2x2[ne_idx], quads_2x2[nw_idx], quads_2x2[sw_idx], quads_2x2[se_idx]);
-                        next_quad = new quad(quads_2x2[ne_idx], quads_2x2[nw_idx], quads_2x2[sw_idx], quads_2x2[se_idx], next_results);
-                        hashmap[next_key] = next_quad;
+                        next_quad = hashmap->get_or_construct(quads_2x2[ne_idx], quads_2x2[nw_idx], quads_2x2[sw_idx], quads_2x2[se_idx]);
+                        next_quad->result = next_results;
                     }
                 }
             }
-        }
-    }
-
-    quad* get_or_add_quad(quad* ne, quad* nw, quad* sw, quad* se) {
-        auto key = make_tuple(ne, nw, sw, se);
-        auto it = hashmap.find(key);
-        if (it != hashmap.end()) {
-#ifdef DEBUG_HASH
-            cout << "Quad of size " << it->second->size << " is already hashed." << endl;
-#endif
-            return it->second;
-        } else {
-            quad* new_quad = new quad(ne, nw, sw, se);
-            hashmap[key] = new_quad;
-#ifdef DEBUG_HASH
-            cout << "Quad of size " << new_quad->size << " was created. ";
-            if (top_quad == ne || top_quad == nw || top_quad == sw || top_quad == se) {
-                cout << "The newly created quad uses top_quad as a child. This should only occur in edge cases where everything is dead.";
-            }
-            cout << endl;
-#endif
-            return new_quad;
         }
     }
 
@@ -188,7 +277,7 @@ public:
 
         // force initial state size to be a power of 2
         int initial_state_sidelength = initial_state.size();
-        if (!((initial_state_sidelength) > 0 && ((initial_state_sidelength) & ((initial_state_sidelength) - 1)) == 0)) {
+        if (!IS_POWER_OF_TWO(initial_state_sidelength)) {
             cout << "Bad input shape." << endl;
             throw;
         }
@@ -201,9 +290,6 @@ public:
 
         // initialize hashmap
         initialize_hashmap();
-#ifdef DEBUG_HASH
-        cout << "Hashmap initialization complete." << endl;
-#endif
 
         // convert grid of bools to grid of (1x1) quads
         vector<vector<quad*>> initial_state_quad(initial_state_sidelength, vector<quad*>(initial_state_sidelength, nullptr));
@@ -219,7 +305,7 @@ public:
         while (half_step < initial_state_sidelength) {
             for (int y = 0; y < initial_state_sidelength; y += 2 * half_step) {
                 for (int x = 0; x < initial_state_sidelength; x += 2 * half_step) {
-                    initial_state_quad[y][x] = get_or_add_quad(
+                    initial_state_quad[y][x] = hashmap->get_or_construct(
                         initial_state_quad[y][x + half_step], 
                         initial_state_quad[y][x], 
                         initial_state_quad[y + half_step][x], 
@@ -229,28 +315,22 @@ public:
             half_step *= 2;
         }
         top_quad = initial_state_quad[0][0];
-#ifdef VERBOSE
-        cout << "Construction of initial state representation complete." << endl;
-#endif
     }
+
+    hashlife(hashlife&&) = delete;
+    hashlife& operator=(hashlife&&) = delete;
 
     quad* get_or_compute_result(quad* input) {
         if (input->result != nullptr) {
-#ifdef DEBUG_RESULT
-            cout << "Result already available for quad of size " << input->size << "." << endl;
-#endif
             return input->result;
         } else {
-#ifdef DEBUG_RESULT
-            cout << "Computing result for quad of size " << input->size << "." << endl;
-#endif
             
             // construct 5 auxillary quads
-            quad* aux_n = get_or_add_quad(input->ne->nw, input->nw->ne, input->nw->se, input->ne->sw);
-            quad* aux_w = get_or_add_quad(input->nw->se, input->nw->sw, input->sw->nw, input->sw->ne);
-            quad* aux_s = get_or_add_quad(input->se->nw, input->sw->ne, input->sw->se, input->se->sw);
-            quad* aux_e = get_or_add_quad(input->ne->se, input->ne->sw, input->se->nw, input->se->ne);
-            quad* aux_c = get_or_add_quad(input->ne->sw, input->nw->se, input->sw->ne, input->se->nw);
+            quad* aux_n = hashmap->get_or_construct(input->ne->nw, input->nw->ne, input->nw->se, input->ne->sw);
+            quad* aux_w = hashmap->get_or_construct(input->nw->se, input->nw->sw, input->sw->nw, input->sw->ne);
+            quad* aux_s = hashmap->get_or_construct(input->se->nw, input->sw->ne, input->sw->se, input->se->sw);
+            quad* aux_e = hashmap->get_or_construct(input->ne->se, input->ne->sw, input->se->nw, input->se->ne);
+            quad* aux_c = hashmap->get_or_construct(input->ne->sw, input->nw->se, input->sw->ne, input->se->nw);
 
             // first 9 "scoops"
             quad* layer2_e = get_or_compute_result(aux_e);
@@ -264,10 +344,10 @@ public:
             quad* layer2_c = get_or_compute_result(aux_c);
 
             // construct 4 auxillary quads
-            quad* layer2_aux_ne = get_or_add_quad(layer2_ne, layer2_n, layer2_c, layer2_e);
-            quad* layer2_aux_nw = get_or_add_quad(layer2_n, layer2_nw, layer2_w, layer2_c);
-            quad* layer2_aux_sw = get_or_add_quad(layer2_c, layer2_w, layer2_sw, layer2_s);
-            quad* layer2_aux_se = get_or_add_quad(layer2_e, layer2_c, layer2_s, layer2_se);
+            quad* layer2_aux_ne = hashmap->get_or_construct(layer2_ne, layer2_n, layer2_c, layer2_e);
+            quad* layer2_aux_nw = hashmap->get_or_construct(layer2_n, layer2_nw, layer2_w, layer2_c);
+            quad* layer2_aux_sw = hashmap->get_or_construct(layer2_c, layer2_w, layer2_sw, layer2_s);
+            quad* layer2_aux_se = hashmap->get_or_construct(layer2_e, layer2_c, layer2_s, layer2_se);
 
             // next 4 "scoops"
             quad* result_ne = get_or_compute_result(layer2_aux_ne);
@@ -276,7 +356,7 @@ public:
             quad* result_se = get_or_compute_result(layer2_aux_se);
 
             // construct, save, and return result
-            quad* result = get_or_add_quad(result_ne, result_nw, result_sw, result_se);
+            quad* result = hashmap->get_or_construct(result_ne, result_nw, result_sw, result_se);
             input->result = result;
             return result;
         }
@@ -284,18 +364,18 @@ public:
 
     quad* get_dead_quad(int size) {
         while (size >= dead_quads.size()) {
-            dead_quads.push_back(get_or_add_quad(dead_quads.back(), dead_quads.back(), dead_quads.back(), dead_quads.back()));
+            dead_quads.push_back(hashmap->get_or_construct(dead_quads.back(), dead_quads.back(), dead_quads.back(), dead_quads.back()));
         }
         return dead_quads[size];
     }
 
     void pad_top_quad() {
-        quad* dead_quad = get_dead_quad(top_quad->ne->size);
-        quad* new_ne = get_or_add_quad(dead_quad, dead_quad, top_quad->ne, dead_quad);
-        quad* new_nw = get_or_add_quad(dead_quad, dead_quad, dead_quad, top_quad->nw);
-        quad* new_sw = get_or_add_quad(top_quad->sw, dead_quad, dead_quad, dead_quad);
-        quad* new_se = get_or_add_quad(dead_quad, top_quad->se, dead_quad, dead_quad);
-        top_quad = get_or_add_quad(new_ne, new_nw, new_sw, new_se);
+        quad* dead_quad = get_dead_quad(top_quad->ne->log_size);
+        quad* new_ne = hashmap->get_or_construct(dead_quad, dead_quad, top_quad->ne, dead_quad);
+        quad* new_nw = hashmap->get_or_construct(dead_quad, dead_quad, dead_quad, top_quad->nw);
+        quad* new_sw = hashmap->get_or_construct(top_quad->sw, dead_quad, dead_quad, dead_quad);
+        quad* new_se = hashmap->get_or_construct(dead_quad, top_quad->se, dead_quad, dead_quad);
+        top_quad = hashmap->get_or_construct(new_ne, new_nw, new_sw, new_se);
     }
 
     vector<vector<quad*>> expand_result(vector<vector<quad*>> input_grid, tuple<int, int, int, int, int, int> input_step, tuple<int, int, int, int, int, int> output_step) {
@@ -321,13 +401,13 @@ public:
             for (int next_aux_idx_x = 0; next_aux_idx_x <= output_dims_x; next_aux_idx_x++) {
                 if (next_aux_is_combo_x) {
                     if (next_aux_is_combo_y) {
-                        aux_grid[next_aux_idx_y][next_aux_idx_x] = get_or_add_quad(
+                        aux_grid[next_aux_idx_y][next_aux_idx_x] = hashmap->get_or_construct(
                             input_grid[next_input_idx_y][next_input_idx_x + 1]->sw->sw,
                             input_grid[next_input_idx_y][next_input_idx_x]->se->se,
                             input_grid[next_input_idx_y + 1][next_input_idx_x]->ne->ne,
                             input_grid[next_input_idx_y + 1][next_input_idx_x + 1]->nw->nw);
                     } else {
-                        aux_grid[next_aux_idx_y][next_aux_idx_x] = get_or_add_quad(
+                        aux_grid[next_aux_idx_y][next_aux_idx_x] = hashmap->get_or_construct(
                             input_grid[next_input_idx_y][next_input_idx_x + 1]->nw->sw,
                             input_grid[next_input_idx_y][next_input_idx_x]->ne->se,
                             input_grid[next_input_idx_y][next_input_idx_x]->se->ne,
@@ -336,13 +416,13 @@ public:
                     next_input_idx_x++;
                 } else {
                     if (next_aux_is_combo_y) {
-                        aux_grid[next_aux_idx_y][next_aux_idx_x] = get_or_add_quad(
+                        aux_grid[next_aux_idx_y][next_aux_idx_x] = hashmap->get_or_construct(
                             input_grid[next_input_idx_y][next_input_idx_x]->se->sw,
                             input_grid[next_input_idx_y][next_input_idx_x]->sw->se,
                             input_grid[next_input_idx_y + 1][next_input_idx_x]->nw->ne,
                             input_grid[next_input_idx_y + 1][next_input_idx_x]->ne->nw);
                     } else {
-                        aux_grid[next_aux_idx_y][next_aux_idx_x] = get_or_add_quad(
+                        aux_grid[next_aux_idx_y][next_aux_idx_x] = hashmap->get_or_construct(
                             input_grid[next_input_idx_y][next_input_idx_x]->ne->sw,
                             input_grid[next_input_idx_y][next_input_idx_x]->nw->se,
                             input_grid[next_input_idx_y][next_input_idx_x]->sw->ne,
@@ -361,7 +441,7 @@ public:
         vector<vector<quad*>> aux_grid_2(output_dims_y, vector<quad*>(output_dims_x, nullptr));
         for (int next_aux_idx_y = 0; next_aux_idx_y < output_dims_y; next_aux_idx_y++) {
             for (int next_aux_idx_x = 0; next_aux_idx_x < output_dims_x; next_aux_idx_x++) {
-                aux_grid_2[next_aux_idx_y][next_aux_idx_x] = get_or_add_quad(
+                aux_grid_2[next_aux_idx_y][next_aux_idx_x] = hashmap->get_or_construct(
                     aux_grid[next_aux_idx_y][next_aux_idx_x + 1],
                     aux_grid[next_aux_idx_y][next_aux_idx_x],
                     aux_grid[next_aux_idx_y + 1][next_aux_idx_x],
@@ -376,13 +456,6 @@ public:
                 output_grid[next_output_idx_y][next_output_idx_x] = get_or_compute_result(aux_grid_2[next_output_idx_y][next_output_idx_x]);
             }
         }
-
-#ifdef DEBUG_EXPAND
-            cout << "Expanding using result method. "
-                 << "Input grid has height " << input_grid.size() << " and width " << input_grid[0].size() << ". "
-                 << "Output grid has height " << output_grid.size() << " and width " << output_grid[0].size() << ". " << endl;
-#endif
-
         return output_grid;
     }
 
@@ -427,13 +500,6 @@ public:
             }
             next_input_child_is_south = !next_input_child_is_south;
         }
-
-#ifdef DEBUG_EXPAND
-            cout << "Expanding using static method. "
-                 << "Input grid has height " << input_grid.size() << " and width " << input_grid[0].size() << ". "
-                 << "Output grid has height " << output_grid.size() << " and width " << output_grid[0].size() << ". " << endl;
-#endif
-
         return output_grid;
     }
 
@@ -452,7 +518,7 @@ public:
         int next_size;
         int desired_depth;
         int depth;
-        while (true) {
+        for(;;) {
 
             // stop if:
             // 1. we are at time zero AND
@@ -462,7 +528,7 @@ public:
             stop = true;
             if (get<0>(steps.back()) > 0) {
                 stop = false;
-            } else if ((1 << get<1>(steps.back())) < top_quad->size - 1) {
+            } else if ((1 << get<1>(steps.back())) < top_quad->log_size - 1) {
                 stop = false;
             } else {
                 nonzero_bound = 0;
@@ -534,21 +600,9 @@ public:
                     round_two(get<5>(steps.back()), next_size, true)});
             }
         }
-
-#ifdef DEBUG_EXPAND
-            for (const auto& step : steps) {
-                cout << "(" 
-                          << get<0>(step) << ", " 
-                          << get<1>(step) << ", " 
-                          << get<2>(step) << ", " 
-                          << get<3>(step) << ", " 
-                          << get<4>(step) << ", " 
-                          << get<5>(step) << ")" << endl;
-            }
-#endif
-
+        
         // ensure our top quad is large enough to proceed and apply padding if not
-        while (get<1>(steps.back()) > top_quad->size - 1) {
+        while (get<1>(steps.back()) > top_quad->log_size - 1) {
             pad_top_quad();
         }
 
@@ -599,6 +653,12 @@ public:
         return result_bool;
     }
 
+    void rehash() {
+        serial_hashmap* new_hashmap = serial_hashmap::rehash(hashmap);
+        delete hashmap;
+        hashmap = new_hashmap;
+    }
+
     static void print_grid(const vector<vector<bool>>& grid) {
         std::cout << '|';
         for (size_t i = 0; i < grid[0].size(); ++i) std::cout << '-';
@@ -615,44 +675,31 @@ public:
         std::cout << '|' << std::endl;
     }
 
-    vector<vector<bool>> expand_quad(quad* input) {
-        // convert a quad to a grid of bools for inspection
-        if (input == nullptr) {
-            return {};
-        } else if (input == dead_cell) {
-            return {{false}};
-        } else if (input == live_cell) {
-            return {{true}};
-        }
-        auto ne_grid = expand_quad(input->ne);
-        auto nw_grid = expand_quad(input->nw);
-        auto sw_grid = expand_quad(input->sw);
-        auto se_grid = expand_quad(input->se);
-        int half_size = ne_grid.size();
-        vector<vector<bool>> result(2 * half_size, vector<bool>(2 * half_size));
-        for (int i = 0; i < half_size; ++i) {
-            for (int j = 0; j < half_size; ++j) {
-                result[i][j] = nw_grid[i][j];
-                result[i][j + half_size] = ne_grid[i][j];
-                result[i + half_size][j] = sw_grid[i][j];
-                result[i + half_size][j + half_size] = se_grid[i][j];
-            }
-        }
-        return result;
-    }
-
-    bool verify_hashmap(quad* node) {
-        // verify correctness of the hashmap
-        if (node == dead_cell || node == live_cell) {
-            return true;
-        }
-        auto key = make_tuple(node->ne, node->nw, node->sw, node->se);
-        if (hashmap.find(key) == hashmap.end() || hashmap[key] != node) {
-            return false;
-        }
-        return verify_hashmap(node->ne) && verify_hashmap(node->nw) && verify_hashmap(node->sw) && verify_hashmap(node->se);
-    }
-
+    // vector<vector<bool>> expand_quad(quad* input) {
+    //     // convert a quad to a grid of bools for debugging purposes
+    //     if (input == nullptr) {
+    //         return {};
+    //     } else if (input == dead_cell) {
+    //         return {{false}};
+    //     } else if (input == live_cell) {
+    //         return {{true}};
+    //     }
+    //     auto ne_grid = expand_quad(input->ne);
+    //     auto nw_grid = expand_quad(input->nw);
+    //     auto sw_grid = expand_quad(input->sw);
+    //     auto se_grid = expand_quad(input->se);
+    //     int half_size = ne_grid.size();
+    //     vector<vector<bool>> result(2 * half_size, vector<bool>(2 * half_size));
+    //     for (int i = 0; i < half_size; ++i) {
+    //         for (int j = 0; j < half_size; ++j) {
+    //             result[i][j] = nw_grid[i][j];
+    //             result[i][j + half_size] = ne_grid[i][j];
+    //             result[i + half_size][j] = sw_grid[i][j];
+    //             result[i + half_size][j + half_size] = se_grid[i][j];
+    //         }
+    //     }
+    //     return result;
+    // }
 };
 
 int main() {
@@ -663,11 +710,11 @@ int main() {
     vector<vector<bool>> initial_state(initial_state_sidelength, vector<bool>(initial_state_sidelength, false));
 
     // r-pentomino
-    initial_state[middle - 1][middle    ] = true;
-    initial_state[middle    ][middle - 1] = true;
-    initial_state[middle    ][middle    ] = true;
-    initial_state[middle + 1][middle    ] = true;
-    initial_state[middle + 1][middle + 1] = true;
+    // initial_state[middle - 1][middle    ] = true;
+    // initial_state[middle    ][middle - 1] = true;
+    // initial_state[middle    ][middle    ] = true;
+    // initial_state[middle + 1][middle    ] = true;
+    // initial_state[middle + 1][middle + 1] = true;
 
     // // glider
     // initial_state[middle - 1][middle - 1] = true;
@@ -686,7 +733,7 @@ int main() {
     // initial_state[middle + 1][middle - 1] = true;
     // initial_state[middle + 2][middle    ] = true;
     // initial_state[middle + 2][middle + 3] = true; 
-    
+
     // 20-cell quadratic growth
     initial_state[middle + 32][middle     ] = true;
     initial_state[middle + 30][middle +  1] = true;
@@ -724,24 +771,25 @@ int main() {
     // render some viewports
     vector<vector<vector<bool>>*> viewports(n_timesteps, nullptr); 
     auto start = std::chrono::system_clock::now();
-    for (int curr_timestep = 0; curr_timestep < n_timesteps; curr_timestep++) {
-        viewports[curr_timestep] = my_hashlife.show_viewport(curr_timestep, x_min, y_min, x_max, y_max);
+    for (int i = 0; i < n_timesteps; i++) {
+        if (my_hashlife.hashmap->rehash_needed) {
+            my_hashlife.rehash();
+        }
+        viewports[i] = my_hashlife.show_viewport(i, x_min, y_min, x_max, y_max);
     }
     auto end = std::chrono::system_clock::now();
     std::chrono::duration<double> elapsed_seconds = end - start;
     std::cout << "Computation took " << elapsed_seconds.count() << " seconds." << std::endl;
-#ifdef ENABLE_SLEEP
-    usleep(5000000);
-#endif
 
-    // show the viewports
+#ifdef ENABLE_VISUAL
+    usleep(5000000);
     for (int i = 0; i < n_timesteps; ++i) {
         hashlife::print_grid(*viewports[i]);
         delete viewports[i];
-#ifdef ENABLE_SLEEP
         usleep(50000);
-#endif
     }
+#endif
 
     return 0;
+
 }
