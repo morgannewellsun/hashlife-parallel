@@ -12,6 +12,9 @@
 
 using namespace std;
 
+int comm_size;
+int comm_rank;
+
 int round_two(int number, int exponent, bool round_up) {
     int power_of_two = 1 << exponent;
     if (number < 0) {
@@ -26,65 +29,158 @@ int round_two(int number, int exponent, bool round_up) {
     return (number < 0) ? -abs_number : abs_number;
 }
 
-struct quad {
+struct remote_quad;
+
+int quad_cnt = 0;
+
+struct quad {                  // physical quad at local machine.
+    remote_quad* ne;
+    remote_quad* nw;
+    remote_quad* sw;
+    remote_quad* se;
+    remote_quad* result;
+
+    quad()
+        : ne(nullptr), nw(nullptr), sw(nullptr), se(nullptr), result(nullptr) {
+        ++quad_cnt;
+    }
+
+    quad(remote_quad* ne, remote_quad* nw, remote_quad* sw, remote_quad* se)
+        : ne(ne), nw(nw), sw(sw), se(se), result(nullptr) {
+        ++quad_cnt;
+    }
+
+    quad(remote_quad* ne, remote_quad* nw, remote_quad* sw, remote_quad* se, remote_quad* result)
+        : ne(ne), nw(nw), sw(sw), se(se), result(result) {
+        ++quad_cnt;
+    }
+
+    void update_result(remote_quad*& rq) {
+        result = rq;
+    }
+};
+
+struct remote_quad {
     int size; // square macrocell with side lengths 2^size
-    quad* ne;
-    quad* nw;
-    quad* sw;
-    quad* se;
-    quad* result;
+    size_t remote_rank;       // The MPI rank, i.e., computing server/core/process identifier, that holds its physical quad.
+    uintptr_t remote_address;    // The memory address in the machine identified by rank, that point to its physical quad.
+    int id;
 
-    quad() 
-        : size(0), ne(nullptr), nw(nullptr), sw(nullptr), se(nullptr), result(nullptr) {}
+    remote_quad(int id) : size(0), remote_rank(comm_rank), id(id) {
+        remote_address = reinterpret_cast<uintptr_t>(new quad());
+    }
 
-    quad(quad* ne, quad* nw, quad* sw, quad* se) 
-        : size(ne->size + 1), ne(ne), nw(nw), sw(sw), se(se), result(nullptr) {}
+    static size_t calc_rank(remote_quad* ne, remote_quad* nw, remote_quad* sw, remote_quad* se) {
+        return (ne->remote_rank + nw->remote_rank + sw->remote_rank + se->remote_rank) % comm_size;
+    }
 
-    quad(quad* ne, quad* nw, quad* sw, quad* se, quad* result) 
-        : size(ne->size + 1), ne(ne), nw(nw), sw(sw), se(se), result(result) {}
+    remote_quad(remote_quad* ne, remote_quad* nw, remote_quad* sw, remote_quad* se, int id = 0)
+        : size(ne->size + 1), id(id) {
+        remote_rank = calc_rank(ne, nw, sw, se);
+        if (remote_rank == comm_rank)          // sunheng: The hashmap should be global and registration should be performed here.
+            remote_address = reinterpret_cast<uintptr_t>(new quad(ne, nw, sw, se));
+    }
 
-    bool operator==(const quad& other) const {
-        return ne == other.ne && nw == other.nw && sw == other.sw && se == other.se;
+    remote_quad(remote_quad* ne, remote_quad* nw, remote_quad* sw, remote_quad* se, remote_quad* result, int id = 0)
+        : size(ne->size + 1), id(id) {
+        remote_rank = calc_rank(ne, nw, sw, se);
+        if (remote_rank == comm_rank)
+            remote_address = reinterpret_cast<uintptr_t>(new quad(ne, nw, sw, se, result));
+    }
+
+    remote_quad* ne() const {
+        if (remote_rank == comm_rank) {
+            return reinterpret_cast<quad*>(remote_address)->ne;
+        }
+        else {
+            throw runtime_error("We should be all local at ne.");
+        }
+    }
+
+    remote_quad* nw() const {
+        if (remote_rank == comm_rank) {
+            return reinterpret_cast<quad*>(remote_address)->nw;
+        }
+        else {
+            throw runtime_error("We should be all local at nw.");
+        }
+    }
+
+    remote_quad* sw() const {
+        if (remote_rank == comm_rank) {
+            return reinterpret_cast<quad*>(remote_address)->sw;
+        }
+        else {
+            throw runtime_error("We should be all local at sw.");
+        }
+    }
+
+    remote_quad* se() const {
+        if (remote_rank == comm_rank) {
+            return reinterpret_cast<quad*>(remote_address)->se;
+        }
+        else {
+            throw runtime_error("We should be all local at se.");
+        }
+    }
+
+    bool operator==(const remote_quad& other) const {
+        // For large quad, never create duplicated quad at construction.
+        if (other.size != size) return false;
+        if (size > 2) return other.remote_rank == remote_rank && other.remote_address == remote_address;
+        // Now the physical quad must exist locally.
+        return other.id == id;
+    }
+
+    remote_quad* result() {
+        if (remote_rank != comm_rank)
+            throw runtime_error("Unexpected call to non-local object to get result.");
+        return reinterpret_cast<quad*>(remote_address)->result;
+    }
+
+    void update_result(remote_quad*& rq) {
+        reinterpret_cast<quad*>(remote_address)->update_result(rq);
     }
 };
 
 struct quad_hash {
     // hash function that takes four quad* as input
-    size_t operator()(const tuple<quad*, quad*, quad*, quad*>& t) const {
-        size_t h1 = hash<quad*>{}(get<0>(t));
-        size_t h2 = hash<quad*>{}(get<1>(t));
-        size_t h3 = hash<quad*>{}(get<2>(t));
-        size_t h4 = hash<quad*>{}(get<3>(t));
+    size_t operator()(const tuple<remote_quad*, remote_quad*, remote_quad*, remote_quad*>& t) const {
+        size_t h1 = hash<remote_quad*>{}(get<0>(t));
+        size_t h2 = hash<remote_quad*>{}(get<1>(t));
+        size_t h3 = hash<remote_quad*>{}(get<2>(t));
+        size_t h4 = hash<remote_quad*>{}(get<3>(t));
         return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3);
     }
 };
 
 class hashlife {
 public:
-    quad* dead_cell = new quad();
-    quad* live_cell = new quad();
-    unordered_map<tuple<quad*, quad*, quad*, quad*>, quad*, quad_hash> hashmap;
-    quad* top_quad;
-    vector<quad*> dead_quads = {dead_cell};
+    remote_quad* dead_cell = new remote_quad(0);
+    remote_quad* live_cell = new remote_quad(1);
+    unordered_map<tuple<remote_quad*, remote_quad*, remote_quad*, remote_quad*>, remote_quad*, quad_hash> hashmap;
+    remote_quad* top_quad;
+    vector<remote_quad*> dead_quads = {dead_cell};
 
-    unordered_map<tuple<quad*, quad*, quad*, quad*>, quad*, quad_hash> initialize_hashmap() {
+    unordered_map<tuple<remote_quad*, remote_quad*, remote_quad*, remote_quad*>, remote_quad*, quad_hash> initialize_hashmap() {
 
         // enumerate both (1x1) macrocells; these aren't memoized
-        quad* quads_1x1[] = {dead_cell, live_cell};
+        remote_quad* quads_1x1[] = {dead_cell, live_cell};
 
         // create the empty hashmap
-        unordered_map<tuple<quad*, quad*, quad*, quad*>, quad*, quad_hash> hashmap;
+        unordered_map<tuple<remote_quad*, remote_quad*, remote_quad*, remote_quad*>, remote_quad*, quad_hash> hashmap;
 
         // generate and memoize all 16 (2x2) macrocells; they don't have results
-        vector<quad*> quads_2x2;
-        tuple<quad*, quad*, quad*, quad*> next_key;
-        quad* next_quad;
+        vector<remote_quad*> quads_2x2;
+        tuple<remote_quad*, remote_quad*, remote_quad*, remote_quad*> next_key;
+        remote_quad* next_quad;
+        int id = 2;
         for (int ne_idx = 0; ne_idx < 2; ne_idx++) {
             for (int nw_idx = 0; nw_idx < 2; nw_idx++) {
                 for (int sw_idx = 0; sw_idx < 2; sw_idx++) {
                     for (int se_idx = 0; se_idx < 2; se_idx++) {
                         next_key = make_tuple(quads_1x1[ne_idx], quads_1x1[nw_idx], quads_1x1[sw_idx], quads_1x1[se_idx]);
-                        next_quad = new quad(quads_1x1[ne_idx], quads_1x1[nw_idx], quads_1x1[sw_idx], quads_1x1[se_idx]);
+                        next_quad = new remote_quad(quads_1x1[ne_idx], quads_1x1[nw_idx], quads_1x1[sw_idx], quads_1x1[se_idx], id++);
                         hashmap[next_key] = next_quad;
                         quads_2x2.push_back(next_quad);
                     }
@@ -97,11 +193,11 @@ public:
         int results_nw_neighbors;
         int results_sw_neighbors;
         int results_se_neighbors;
-        quad* results_ne;
-        quad* results_nw;
-        quad* results_sw;
-        quad* results_se;
-        quad* next_results;
+        remote_quad* results_ne;
+        remote_quad* results_nw;
+        remote_quad* results_sw;
+        remote_quad* results_se;
+        remote_quad* next_results;
         for (int ne_idx = 0; ne_idx < quads_2x2.size(); ne_idx++) {
             for (int nw_idx = 0; nw_idx < quads_2x2.size(); nw_idx++) {
                 for (int sw_idx = 0; sw_idx < quads_2x2.size(); sw_idx++) {
@@ -112,31 +208,31 @@ public:
                         results_nw_neighbors = 0;
                         results_sw_neighbors = 0;
                         results_se_neighbors = 0;
-                        if (quads_2x2[ne_idx]->ne == quads_1x1[1]) { results_ne_neighbors++; }
-                        if (quads_2x2[ne_idx]->nw == quads_1x1[1]) { results_ne_neighbors++; results_nw_neighbors++; }
-                        if (quads_2x2[ne_idx]->sw == quads_1x1[1]) { results_nw_neighbors++; results_sw_neighbors++; results_se_neighbors++; }
-                        if (quads_2x2[ne_idx]->se == quads_1x1[1]) { results_ne_neighbors++; results_se_neighbors++; }
-                        if (quads_2x2[nw_idx]->ne == quads_1x1[1]) { results_nw_neighbors++; results_ne_neighbors++; }
-                        if (quads_2x2[nw_idx]->nw == quads_1x1[1]) { results_nw_neighbors++; }
-                        if (quads_2x2[nw_idx]->sw == quads_1x1[1]) { results_nw_neighbors++; results_sw_neighbors++; }
-                        if (quads_2x2[nw_idx]->se == quads_1x1[1]) { results_ne_neighbors++; results_sw_neighbors++; results_se_neighbors++; }
-                        if (quads_2x2[sw_idx]->ne == quads_1x1[1]) { results_ne_neighbors++; results_nw_neighbors++; results_se_neighbors++; }
-                        if (quads_2x2[sw_idx]->nw == quads_1x1[1]) { results_sw_neighbors++; results_nw_neighbors++; }
-                        if (quads_2x2[sw_idx]->sw == quads_1x1[1]) { results_sw_neighbors++; }
-                        if (quads_2x2[sw_idx]->se == quads_1x1[1]) { results_sw_neighbors++; results_se_neighbors++; }
-                        if (quads_2x2[se_idx]->ne == quads_1x1[1]) { results_se_neighbors++; results_ne_neighbors++; }
-                        if (quads_2x2[se_idx]->nw == quads_1x1[1]) { results_ne_neighbors++; results_nw_neighbors++; results_sw_neighbors++; }
-                        if (quads_2x2[se_idx]->sw == quads_1x1[1]) { results_se_neighbors++; results_sw_neighbors++; }
-                        if (quads_2x2[se_idx]->se == quads_1x1[1]) { results_se_neighbors++; }
-                        results_ne = (results_ne_neighbors == 3 || (results_ne_neighbors == 2 && quads_2x2[ne_idx]->sw == quads_1x1[1])) ? quads_1x1[1] : quads_1x1[0];
-                        results_nw = (results_nw_neighbors == 3 || (results_nw_neighbors == 2 && quads_2x2[nw_idx]->se == quads_1x1[1])) ? quads_1x1[1] : quads_1x1[0];
-                        results_sw = (results_sw_neighbors == 3 || (results_sw_neighbors == 2 && quads_2x2[sw_idx]->ne == quads_1x1[1])) ? quads_1x1[1] : quads_1x1[0];
-                        results_se = (results_se_neighbors == 3 || (results_se_neighbors == 2 && quads_2x2[se_idx]->nw == quads_1x1[1])) ? quads_1x1[1] : quads_1x1[0];
+                        if (quads_2x2[ne_idx]->ne() == quads_1x1[1]) { results_ne_neighbors++; }
+                        if (quads_2x2[ne_idx]->nw() == quads_1x1[1]) { results_ne_neighbors++; results_nw_neighbors++; }
+                        if (quads_2x2[ne_idx]->sw() == quads_1x1[1]) { results_nw_neighbors++; results_sw_neighbors++; results_se_neighbors++; }
+                        if (quads_2x2[ne_idx]->se() == quads_1x1[1]) { results_ne_neighbors++; results_se_neighbors++; }
+                        if (quads_2x2[nw_idx]->ne() == quads_1x1[1]) { results_nw_neighbors++; results_ne_neighbors++; }
+                        if (quads_2x2[nw_idx]->nw() == quads_1x1[1]) { results_nw_neighbors++; }
+                        if (quads_2x2[nw_idx]->sw() == quads_1x1[1]) { results_nw_neighbors++; results_sw_neighbors++; }
+                        if (quads_2x2[nw_idx]->se() == quads_1x1[1]) { results_ne_neighbors++; results_sw_neighbors++; results_se_neighbors++; }
+                        if (quads_2x2[sw_idx]->ne() == quads_1x1[1]) { results_ne_neighbors++; results_nw_neighbors++; results_se_neighbors++; }
+                        if (quads_2x2[sw_idx]->nw() == quads_1x1[1]) { results_sw_neighbors++; results_nw_neighbors++; }
+                        if (quads_2x2[sw_idx]->sw() == quads_1x1[1]) { results_sw_neighbors++; }
+                        if (quads_2x2[sw_idx]->se() == quads_1x1[1]) { results_sw_neighbors++; results_se_neighbors++; }
+                        if (quads_2x2[se_idx]->ne() == quads_1x1[1]) { results_se_neighbors++; results_ne_neighbors++; }
+                        if (quads_2x2[se_idx]->nw() == quads_1x1[1]) { results_ne_neighbors++; results_nw_neighbors++; results_sw_neighbors++; }
+                        if (quads_2x2[se_idx]->sw() == quads_1x1[1]) { results_se_neighbors++; results_sw_neighbors++; }
+                        if (quads_2x2[se_idx]->se() == quads_1x1[1]) { results_se_neighbors++; }
+                        results_ne = (results_ne_neighbors == 3 || (results_ne_neighbors == 2 && quads_2x2[ne_idx]->sw() == quads_1x1[1])) ? quads_1x1[1] : quads_1x1[0];
+                        results_nw = (results_nw_neighbors == 3 || (results_nw_neighbors == 2 && quads_2x2[nw_idx]->se() == quads_1x1[1])) ? quads_1x1[1] : quads_1x1[0];
+                        results_sw = (results_sw_neighbors == 3 || (results_sw_neighbors == 2 && quads_2x2[sw_idx]->ne() == quads_1x1[1])) ? quads_1x1[1] : quads_1x1[0];
+                        results_se = (results_se_neighbors == 3 || (results_se_neighbors == 2 && quads_2x2[se_idx]->nw() == quads_1x1[1])) ? quads_1x1[1] : quads_1x1[0];
                         next_results = hashmap[make_tuple(results_ne, results_nw, results_sw, results_se)];
                         
                         // store in hashmap
                         next_key = make_tuple(quads_2x2[ne_idx], quads_2x2[nw_idx], quads_2x2[sw_idx], quads_2x2[se_idx]);
-                        next_quad = new quad(quads_2x2[ne_idx], quads_2x2[nw_idx], quads_2x2[sw_idx], quads_2x2[se_idx], next_results);
+                        next_quad = new remote_quad(quads_2x2[ne_idx], quads_2x2[nw_idx], quads_2x2[sw_idx], quads_2x2[se_idx], next_results, id++);
                         hashmap[next_key] = next_quad;
                     }
                 }
@@ -145,25 +241,22 @@ public:
         return hashmap;
     }
 
-    quad* get_or_add_quad(quad* ne, quad* nw, quad* sw, quad* se) {
-        auto key = make_tuple(ne, nw, sw, se);
-        auto it = hashmap.find(key);
-        if (it != hashmap.end()) {
-#ifdef DEBUG_HASH
-            cout << "Quad of size " << it->second->size << " is already hashed." << endl;
-#endif
-            return it->second;
-        } else {
-            quad* new_quad = new quad(ne, nw, sw, se);
-            hashmap[key] = new_quad;
-#ifdef DEBUG_HASH
-            cout << "Quad of size " << new_quad->size << " was created. ";
-            if (top_quad == ne || top_quad == nw || top_quad == sw || top_quad == se) {
-                cout << "The newly created quad uses top_quad as a child. This should only occur in edge cases where everything is dead.";
+    remote_quad* get_or_add_quad(remote_quad* ne, remote_quad* nw, remote_quad* sw, remote_quad* se) {
+        size_t r = remote_quad::calc_rank(ne, nw, sw, se);
+        if (r == comm_rank) {
+            auto key = make_tuple(ne, nw, sw, se);
+            auto it = hashmap.find(key);
+            if (it != hashmap.end()) {
+                return it->second;
             }
-            cout << endl;
-#endif
-            return new_quad;
+            else {
+                remote_quad* new_quad = new remote_quad(ne, nw, sw, se);
+                hashmap[key] = new_quad;
+                return new_quad;
+            }
+        }
+        else {
+            throw runtime_error("Not implemented yet.");
         }
     }
 
@@ -172,13 +265,11 @@ public:
         // force initial state size to be a power of 2
         size_t initial_state_sidelength = initial_state.size();
         if (!((initial_state_sidelength) > 0 && ((initial_state_sidelength) & ((initial_state_sidelength) - 1)) == 0)) {
-            cout << "Bad input shape." << endl;
-            throw;
+            throw runtime_error("Bad input shape.");
         }
         for (auto& row : initial_state) {
             if (row.size() != initial_state_sidelength) {
-                cout << "Bad input shape." << endl;
-                throw;
+                throw runtime_error("Bad input shape.");
             }
         }
 
@@ -189,7 +280,7 @@ public:
 #endif
 
         // convert grid of bools to grid of (1x1) quads
-        vector<vector<quad*>> initial_state_quad(initial_state_sidelength, vector<quad*>(initial_state_sidelength, nullptr));
+        vector<vector<remote_quad*>> initial_state_quad(initial_state_sidelength, vector<remote_quad*>(initial_state_sidelength, nullptr));
         for (int y = 0; y < initial_state_sidelength; y++) {
             for (int x = 0; x < initial_state_sidelength; x++) {
                 initial_state_quad[y][x] = initial_state[y][x] ? live_cell : dead_cell;
@@ -198,7 +289,6 @@ public:
 
         // construct tree representing initial state
         int half_step = 1;
-        tuple<quad*, quad*, quad*, quad*> key;
         while (half_step < initial_state_sidelength) {
             for (int y = 0; y < initial_state_sidelength; y += 2 * half_step) {
                 for (int x = 0; x < initial_state_sidelength; x += 2 * half_step) {
@@ -217,55 +307,51 @@ public:
 #endif
     }
 
-    quad* get_or_compute_result(quad* input) {
-        if (input->result != nullptr) {
-#ifdef DEBUG_RESULT
-            cout << "Result already available for quad of size " << input->size << "." << endl;
-#endif
-            return input->result;
-        } else {
+    remote_quad* get_or_compute_result(remote_quad* input) {
+        remote_quad* result = input->result();
+        if (result == nullptr) {
+            // If we get here, the quad is local and its result has not been computed.
 #ifdef DEBUG_RESULT
             cout << "Computing result for quad of size " << input->size << "." << endl;
 #endif
-            
             // construct 5 auxillary quads
-            quad* aux_n = get_or_add_quad(input->ne->nw, input->nw->ne, input->nw->se, input->ne->sw);
-            quad* aux_w = get_or_add_quad(input->nw->se, input->nw->sw, input->sw->nw, input->sw->ne);
-            quad* aux_s = get_or_add_quad(input->se->nw, input->sw->ne, input->sw->se, input->se->sw);
-            quad* aux_e = get_or_add_quad(input->ne->se, input->ne->sw, input->se->nw, input->se->ne);
-            quad* aux_c = get_or_add_quad(input->ne->sw, input->nw->se, input->sw->ne, input->se->nw);
+            remote_quad* aux_n = get_or_add_quad(input->ne()->nw(), input->nw()->ne(), input->nw()->se(), input->ne()->sw());
+            remote_quad* aux_w = get_or_add_quad(input->nw()->se(), input->nw()->sw(), input->sw()->nw(), input->sw()->ne());
+            remote_quad* aux_s = get_or_add_quad(input->se()->nw(), input->sw()->ne(), input->sw()->se(), input->se()->sw());
+            remote_quad* aux_e = get_or_add_quad(input->ne()->se(), input->ne()->sw(), input->se()->nw(), input->se()->ne());
+            remote_quad* aux_c = get_or_add_quad(input->ne()->sw(), input->nw()->se(), input->sw()->ne(), input->se()->nw());
 
             // first 9 "scoops"
-            quad* layer2_e = get_or_compute_result(aux_e);
-            quad* layer2_ne = get_or_compute_result(input->ne);
-            quad* layer2_n = get_or_compute_result(aux_n);
-            quad* layer2_nw = get_or_compute_result(input->nw);
-            quad* layer2_w = get_or_compute_result(aux_w);
-            quad* layer2_sw = get_or_compute_result(input->sw);
-            quad* layer2_s = get_or_compute_result(aux_s);
-            quad* layer2_se = get_or_compute_result(input->se);
-            quad* layer2_c = get_or_compute_result(aux_c);
+            remote_quad* layer2_e = get_or_compute_result(aux_e);
+            remote_quad* layer2_ne = get_or_compute_result(input->ne());
+            remote_quad* layer2_n = get_or_compute_result(aux_n);
+            remote_quad* layer2_nw = get_or_compute_result(input->nw());
+            remote_quad* layer2_w = get_or_compute_result(aux_w);
+            remote_quad* layer2_sw = get_or_compute_result(input->sw());
+            remote_quad* layer2_s = get_or_compute_result(aux_s);
+            remote_quad* layer2_se = get_or_compute_result(input->se());
+            remote_quad* layer2_c = get_or_compute_result(aux_c);
 
             // construct 4 auxillary quads
-            quad* layer2_aux_ne = get_or_add_quad(layer2_ne, layer2_n, layer2_c, layer2_e);
-            quad* layer2_aux_nw = get_or_add_quad(layer2_n, layer2_nw, layer2_w, layer2_c);
-            quad* layer2_aux_sw = get_or_add_quad(layer2_c, layer2_w, layer2_sw, layer2_s);
-            quad* layer2_aux_se = get_or_add_quad(layer2_e, layer2_c, layer2_s, layer2_se);
+            remote_quad* layer2_aux_ne = get_or_add_quad(layer2_ne, layer2_n, layer2_c, layer2_e);
+            remote_quad* layer2_aux_nw = get_or_add_quad(layer2_n, layer2_nw, layer2_w, layer2_c);
+            remote_quad* layer2_aux_sw = get_or_add_quad(layer2_c, layer2_w, layer2_sw, layer2_s);
+            remote_quad* layer2_aux_se = get_or_add_quad(layer2_e, layer2_c, layer2_s, layer2_se);
 
             // next 4 "scoops"
-            quad* result_ne = get_or_compute_result(layer2_aux_ne);
-            quad* result_nw = get_or_compute_result(layer2_aux_nw);
-            quad* result_sw = get_or_compute_result(layer2_aux_sw);
-            quad* result_se = get_or_compute_result(layer2_aux_se);
+            remote_quad* result_ne = get_or_compute_result(layer2_aux_ne);
+            remote_quad* result_nw = get_or_compute_result(layer2_aux_nw);
+            remote_quad* result_sw = get_or_compute_result(layer2_aux_sw);
+            remote_quad* result_se = get_or_compute_result(layer2_aux_se);
 
             // construct, save, and return result
-            quad* result = get_or_add_quad(result_ne, result_nw, result_sw, result_se);
-            input->result = result;
-            return result;
+            result = get_or_add_quad(result_ne, result_nw, result_sw, result_se);
+            input->update_result(result);
         }
+        return result;
     }
 
-    quad* get_dead_quad(int size) {
+    remote_quad* get_dead_quad(int size) {
         while (size >= dead_quads.size()) {
             dead_quads.push_back(get_or_add_quad(dead_quads.back(), dead_quads.back(), dead_quads.back(), dead_quads.back()));
         }
@@ -273,15 +359,16 @@ public:
     }
 
     void pad_top_quad() {
-        quad* dead_quad = get_dead_quad(top_quad->ne->size);
-        quad* new_ne = get_or_add_quad(dead_quad, dead_quad, top_quad->ne, dead_quad);
-        quad* new_nw = get_or_add_quad(dead_quad, dead_quad, dead_quad, top_quad->nw);
-        quad* new_sw = get_or_add_quad(top_quad->sw, dead_quad, dead_quad, dead_quad);
-        quad* new_se = get_or_add_quad(dead_quad, top_quad->se, dead_quad, dead_quad);
+        remote_quad* dead_quad = get_dead_quad(top_quad->ne()->size);
+        remote_quad* new_ne = get_or_add_quad(dead_quad, dead_quad, top_quad->ne(), dead_quad);             // sunheng: why ne is on the 3rd?
+        remote_quad* new_nw = get_or_add_quad(dead_quad, dead_quad, dead_quad, top_quad->nw());
+        remote_quad* new_sw = get_or_add_quad(top_quad->sw(), dead_quad, dead_quad, dead_quad);
+        remote_quad* new_se = get_or_add_quad(dead_quad, top_quad->se(), dead_quad, dead_quad);
         top_quad = get_or_add_quad(new_ne, new_nw, new_sw, new_se);
     }
 
-    vector<vector<quad*>> expand_result(vector<vector<quad*>> input_grid, tuple<int, int, int, int, int, int> input_step, tuple<int, int, int, int, int, int> output_step) {
+    vector<vector<remote_quad*>> expand_result(vector<vector<remote_quad*>> input_grid,
+        tuple<int, int, int, int, int, int> input_step, tuple<int, int, int, int, int, int> output_step) {
         // macrocell size gets cut in half; time increases by half of the output macrocell sidelength
 
         int depth = 1 << (get<1>(output_step) - 1);
@@ -293,7 +380,7 @@ public:
         size_t output_dims_x = ((input_grid[0].size() - 1) * 2) - (shrink_east ? 1 : 0) - (shrink_west ? 1 : 0);
 
         // create a first auxillary grid (one unit wider and taller than the output)
-        vector<vector<quad*>> aux_grid(output_dims_y + 1, vector<quad*>(output_dims_x + 1, nullptr));
+        vector<vector<remote_quad*>> aux_grid(output_dims_y + 1, vector<remote_quad*>(output_dims_x + 1, nullptr));
         bool next_aux_is_combo_y = shrink_north;
         int next_input_idx_y = 0;
         bool next_aux_is_combo_x;
@@ -305,31 +392,31 @@ public:
                 if (next_aux_is_combo_x) {
                     if (next_aux_is_combo_y) {
                         aux_grid[next_aux_idx_y][next_aux_idx_x] = get_or_add_quad(
-                            input_grid[next_input_idx_y][next_input_idx_x + 1]->sw->sw,
-                            input_grid[next_input_idx_y][next_input_idx_x]->se->se,
-                            input_grid[next_input_idx_y + 1][next_input_idx_x]->ne->ne,
-                            input_grid[next_input_idx_y + 1][next_input_idx_x + 1]->nw->nw);
+                            input_grid[next_input_idx_y][next_input_idx_x + 1]->sw()->sw(),
+                            input_grid[next_input_idx_y][next_input_idx_x]->se()->se(),
+                            input_grid[next_input_idx_y + 1][next_input_idx_x]->ne()->ne(),
+                            input_grid[next_input_idx_y + 1][next_input_idx_x + 1]->nw()->nw());
                     } else {
                         aux_grid[next_aux_idx_y][next_aux_idx_x] = get_or_add_quad(
-                            input_grid[next_input_idx_y][next_input_idx_x + 1]->nw->sw,
-                            input_grid[next_input_idx_y][next_input_idx_x]->ne->se,
-                            input_grid[next_input_idx_y][next_input_idx_x]->se->ne,
-                            input_grid[next_input_idx_y][next_input_idx_x + 1]->sw->nw);
+                            input_grid[next_input_idx_y][next_input_idx_x + 1]->nw()->sw(),
+                            input_grid[next_input_idx_y][next_input_idx_x]->ne()->se(),
+                            input_grid[next_input_idx_y][next_input_idx_x]->se()->ne(),
+                            input_grid[next_input_idx_y][next_input_idx_x + 1]->sw()->nw());
                     }
                     next_input_idx_x++;
                 } else {
                     if (next_aux_is_combo_y) {
                         aux_grid[next_aux_idx_y][next_aux_idx_x] = get_or_add_quad(
-                            input_grid[next_input_idx_y][next_input_idx_x]->se->sw,
-                            input_grid[next_input_idx_y][next_input_idx_x]->sw->se,
-                            input_grid[next_input_idx_y + 1][next_input_idx_x]->nw->ne,
-                            input_grid[next_input_idx_y + 1][next_input_idx_x]->ne->nw);
+                            input_grid[next_input_idx_y][next_input_idx_x]->se()->sw(),
+                            input_grid[next_input_idx_y][next_input_idx_x]->sw()->se(),
+                            input_grid[next_input_idx_y + 1][next_input_idx_x]->nw()->ne(),
+                            input_grid[next_input_idx_y + 1][next_input_idx_x]->ne()->nw());
                     } else {
                         aux_grid[next_aux_idx_y][next_aux_idx_x] = get_or_add_quad(
-                            input_grid[next_input_idx_y][next_input_idx_x]->ne->sw,
-                            input_grid[next_input_idx_y][next_input_idx_x]->nw->se,
-                            input_grid[next_input_idx_y][next_input_idx_x]->sw->ne,
-                            input_grid[next_input_idx_y][next_input_idx_x]->se->nw);
+                            input_grid[next_input_idx_y][next_input_idx_x]->ne()->sw(),
+                            input_grid[next_input_idx_y][next_input_idx_x]->nw()->se(),
+                            input_grid[next_input_idx_y][next_input_idx_x]->sw()->ne(),
+                            input_grid[next_input_idx_y][next_input_idx_x]->se()->nw());
                     }
                 }
                 next_aux_is_combo_x = !next_aux_is_combo_x;
@@ -341,7 +428,7 @@ public:
         }
 
         // create a second auxillary grid (same size as the output)
-        vector<vector<quad*>> aux_grid_2(output_dims_y, vector<quad*>(output_dims_x, nullptr));
+        vector<vector<remote_quad*>> aux_grid_2(output_dims_y, vector<remote_quad*>(output_dims_x, nullptr));
         for (int next_aux_idx_y = 0; next_aux_idx_y < output_dims_y; next_aux_idx_y++) {
             for (int next_aux_idx_x = 0; next_aux_idx_x < output_dims_x; next_aux_idx_x++) {
                 aux_grid_2[next_aux_idx_y][next_aux_idx_x] = get_or_add_quad(
@@ -353,7 +440,7 @@ public:
         }
 
         // get the output by taking the result of every element of the second auxillary grid
-        vector<vector<quad*>> output_grid(output_dims_y, vector<quad*>(output_dims_x, nullptr));
+        vector<vector<remote_quad*>> output_grid(output_dims_y, vector<remote_quad*>(output_dims_x, nullptr));
         for (int next_output_idx_y = 0; next_output_idx_y < output_dims_y; next_output_idx_y++) {
             for (int next_output_idx_x = 0; next_output_idx_x < output_dims_x; next_output_idx_x++) {
                 output_grid[next_output_idx_y][next_output_idx_x] = get_or_compute_result(aux_grid_2[next_output_idx_y][next_output_idx_x]);
@@ -369,7 +456,7 @@ public:
         return output_grid;
     }
 
-    vector<vector<quad*>> expand_static(vector<vector<quad*>> input_grid, tuple<int, int, int, int, int, int> input_step, tuple<int, int, int, int, int, int> output_step) {
+    vector<vector<remote_quad*>> expand_static(vector<vector<remote_quad*>> input_grid, tuple<int, int, int, int, int, int> input_step, tuple<int, int, int, int, int, int> output_step) {
         // macrocell size gets cut in half; time remains unchanged
 
         bool shrink_east = get<4>(input_step) != get<4>(output_step);
@@ -380,7 +467,7 @@ public:
         size_t output_dims_x = (input_grid[0].size() * 2) - (shrink_east ? 1 : 0) - (shrink_west ? 1 : 0);
 
         // construct the output grid using children of the macrocells in the input grid
-        vector<vector<quad*>> output_grid(output_dims_y, vector<quad*>(output_dims_x, nullptr));
+        vector<vector<remote_quad*>> output_grid(output_dims_y, vector<remote_quad*>(output_dims_x, nullptr));
         bool next_input_child_is_south = shrink_north;
         int next_input_idx_y = 0;
         bool next_input_child_is_east;
@@ -391,16 +478,16 @@ public:
             for (int next_output_idx_x = 0; next_output_idx_x < output_dims_x; next_output_idx_x++) {
                 if (next_input_child_is_east) {
                     if (next_input_child_is_south) {
-                        output_grid[next_output_idx_y][next_output_idx_x] = input_grid[next_input_idx_y][next_input_idx_x]->se;
+                        output_grid[next_output_idx_y][next_output_idx_x] = input_grid[next_input_idx_y][next_input_idx_x]->se();
                     } else { 
-                        output_grid[next_output_idx_y][next_output_idx_x] = input_grid[next_input_idx_y][next_input_idx_x]->ne;
+                        output_grid[next_output_idx_y][next_output_idx_x] = input_grid[next_input_idx_y][next_input_idx_x]->ne();
                     }
                     next_input_idx_x++;
                 } else {
                     if (next_input_child_is_south) {
-                        output_grid[next_output_idx_y][next_output_idx_x] = input_grid[next_input_idx_y][next_input_idx_x]->sw;
+                        output_grid[next_output_idx_y][next_output_idx_x] = input_grid[next_input_idx_y][next_input_idx_x]->sw();
                     } else {
-                        output_grid[next_output_idx_y][next_output_idx_x] = input_grid[next_input_idx_y][next_input_idx_x]->nw;
+                        output_grid[next_output_idx_y][next_output_idx_x] = input_grid[next_input_idx_y][next_input_idx_x]->nw();
                     }
                 }
                 next_input_child_is_east = !next_input_child_is_east;
@@ -536,30 +623,30 @@ public:
         }
 
         // manually determine our starting point, which is comprised of one, two, or four children of top_quad
-        vector<vector<quad*>> result;
+        vector<vector<remote_quad*>> result;
         if (get<2>(steps.back()) == 0) {
             if (get<3>(steps.back()) == 0) {
-                result = {{top_quad->se}};
+                result = {{top_quad->se()}};
             } else if (get<5>(steps.back()) == 0) {
-                result = {{top_quad->ne}};
+                result = {{top_quad->ne()}};
             } else {
-                result = {{top_quad->ne}, {top_quad->se}};
+                result = {{top_quad->ne()}, {top_quad->se()}};
             }
         } else if (get<4>(steps.back()) == 0) {
             if (get<3>(steps.back()) == 0) {
-                result = {{top_quad->sw}};
+                result = {{top_quad->sw()}};
             } else if (get<5>(steps.back()) == 0) {
-                result = {{top_quad->nw}};
+                result = {{top_quad->nw()}};
             } else {
-                result = {{top_quad->nw}, {top_quad->sw}};
+                result = {{top_quad->nw()}, {top_quad->sw()}};
             }
         } else {
             if (get<3>(steps.back()) == 0) {
-                result = {{top_quad->sw, top_quad->se}};
+                result = {{top_quad->sw(), top_quad->se()}};
             } else if (get<5>(steps.back()) == 0) {
-                result = {{top_quad->nw, top_quad->ne}};
+                result = {{top_quad->nw(), top_quad->ne()}};
             } else {
-                result = {{top_quad->nw, top_quad->ne}, {top_quad->sw, top_quad->se}};
+                result = {{top_quad->nw(), top_quad->ne()}, {top_quad->sw(), top_quad->se()}};
             }
         }
 
@@ -598,7 +685,7 @@ public:
         std::cout << '|' << std::endl;
     }
 
-    vector<vector<bool>> expand_quad(quad* input) {
+    vector<vector<bool>> expand_quad(remote_quad* input) {
         // convert a quad to a grid of bools for inspection
         if (input == nullptr) {
             return {};
@@ -607,10 +694,10 @@ public:
         } else if (input == live_cell) {
             return {{true}};
         }
-        auto ne_grid = expand_quad(input->ne);
-        auto nw_grid = expand_quad(input->nw);
-        auto sw_grid = expand_quad(input->sw);
-        auto se_grid = expand_quad(input->se);
+        auto ne_grid = expand_quad(input->ne());
+        auto nw_grid = expand_quad(input->nw());
+        auto sw_grid = expand_quad(input->sw());
+        auto se_grid = expand_quad(input->se());
         size_t half_size = ne_grid.size();
         vector<vector<bool>> result(2 * half_size, vector<bool>(2 * half_size));
         for (int i = 0; i < half_size; ++i) {
@@ -624,21 +711,23 @@ public:
         return result;
     }
 
-    bool verify_hashmap(quad* node) {
+    bool verify_hashmap(remote_quad* node) {
         // verify correctness of the hashmap
         if (node == dead_cell || node == live_cell) {
             return true;
         }
-        auto key = make_tuple(node->ne, node->nw, node->sw, node->se);
+        auto key = make_tuple(node->ne(), node->nw(), node->sw(), node->se());
         if (hashmap.find(key) == hashmap.end() || hashmap[key] != node) {
             return false;
         }
-        return verify_hashmap(node->ne) && verify_hashmap(node->nw) && verify_hashmap(node->sw) && verify_hashmap(node->se);
+        return verify_hashmap(node->ne()) && verify_hashmap(node->nw()) && verify_hashmap(node->sw()) && verify_hashmap(node->se());
     }
 
 };
 
 int main() {
+    comm_size = 1;
+    comm_rank = 0;
 
     // empty grid
     int initial_state_sidelength = 16;
@@ -696,7 +785,7 @@ int main() {
 
     // render some viewports
     int cnt = 0;
-    quad* old = 0;
+    remote_quad* old = 0;
     for (int i = 0; i < 1200; i++) {
         true ? my_hashlife.show_viewport(i, -51, -28, 52, 29) : hashlife::print_grid(my_hashlife.show_viewport(i, -51, -28, 52, 29));
         if (my_hashlife.top_quad == old) {
@@ -708,7 +797,7 @@ int main() {
             cnt = 1;
         }
     }
-    std::cout << old << " appeared " << cnt << " times." << std::endl;
+    std::cout << old << " appeared " << cnt << " times. Total physical quads created: " << quad_cnt << std::endl;
 
     return 0;
 }
