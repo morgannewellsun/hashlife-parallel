@@ -9,8 +9,11 @@
 #include <tuple>
 #include <unordered_map>
 #include <vector>
+#include <mpi.h>
 
 using namespace std;
+
+const int TAG_REQUEST_QUAD = 1;
 
 int comm_size;
 int comm_rank;
@@ -60,6 +63,27 @@ struct quad {                  // physical quad at local machine.
     }
 };
 
+uintptr_t request_quad(size_t remote_rank, remote_quad* ne, remote_quad* nw, remote_quad* sw, remote_quad* se) {
+    MPI_Request ask;
+    unsigned long data[8] = {
+        ne->remote_rank, ne->remote_address, nw->remote_rank, nw->remote_address,
+        sw->remote_rank, sw->remote_address, se->remote_rank, se->remote_address };
+    MPI_Isend(data, 8, MPI_UNSIGNED_LONG, remote_rank, TAG_REQUEST_QUAD, MPI_COMM_WORLD, &ask);
+    int ready = 0;
+    MPI_Request req;
+    while (!ready) {
+        for (int r = 0; r < comm_size; ++r) {
+            if (r == comm_rank) continue;
+            if (MPI_Irecv(data, 8, MPI_UNSIGNED_LONG, r, TAG_REQUEST_QUAD, MPI_COMM_WORLD, &req) == 0) {
+                // We got a request from rank r.
+                // Need construct remote_quote and return its address to the requester.
+            }
+        }
+        MPI_Test(&ask, &ready, MPI_STATUS_IGNORE);
+        // If successful, we are done with this.
+    }
+}
+
 struct remote_quad {
     int size; // square macrocell with side lengths 2^size
     size_t remote_rank;       // The MPI rank, i.e., computing server/core/process identifier, that holds its physical quad.
@@ -67,6 +91,7 @@ struct remote_quad {
     int id;
 
     remote_quad(int id) : size(0), remote_rank(comm_rank), id(id) {
+        // This contructor is only called for 1x1 quad.
         remote_address = reinterpret_cast<uintptr_t>(new quad());
     }
 
@@ -77,8 +102,13 @@ struct remote_quad {
     remote_quad(remote_quad* ne, remote_quad* nw, remote_quad* sw, remote_quad* se, int id = 0)
         : size(ne->size + 1), id(id) {
         remote_rank = calc_rank(ne, nw, sw, se);
-        if (remote_rank == comm_rank)          // sunheng: The hashmap should be global and registration should be performed here.
+        if (remote_rank == comm_rank) {
+            // sunheng: The hashmap should be global and registration should be performed here.
             remote_address = reinterpret_cast<uintptr_t>(new quad(ne, nw, sw, se));
+        }
+        else {
+            remote_address = request_quad(remote_rank, ne, nw, sw, se);
+        }
     }
 
     remote_quad(remote_quad* ne, remote_quad* nw, remote_quad* sw, remote_quad* se, remote_quad* result, int id = 0)
@@ -725,9 +755,10 @@ public:
 
 };
 
-int main() {
-    comm_size = 1;
-    comm_rank = 0;
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &comm_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
 
     // empty grid
     int initial_state_sidelength = 16;
@@ -798,6 +829,6 @@ int main() {
         }
     }
     std::cout << old << " appeared " << cnt << " times. Total physical quads created: " << quad_cnt << std::endl;
-
+    MPI_Finalize();
     return 0;
 }
