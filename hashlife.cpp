@@ -2,7 +2,6 @@
 // #define DEBUG_RESULT
 // #define DEBUG_EXPAND
 // #define VERBOSE
-#define ENABLE_SLEEP
 
 #include <cmath>
 #include <functional>
@@ -10,9 +9,6 @@
 #include <tuple>
 #include <unordered_map>
 #include <vector>
-#ifdef ENABLE_SLEEP
-    #include <unistd.h>
-#endif
 
 using namespace std;
 
@@ -174,7 +170,7 @@ public:
     hashlife(const vector<vector<bool>>& initial_state) {
 
         // force initial state size to be a power of 2
-        int initial_state_sidelength = initial_state.size();
+        size_t initial_state_sidelength = initial_state.size();
         if (!((initial_state_sidelength) > 0 && ((initial_state_sidelength) & ((initial_state_sidelength) - 1)) == 0)) {
             cout << "Bad input shape." << endl;
             throw;
@@ -293,8 +289,8 @@ public:
         bool shrink_north = get<3>(input_step) != get<3>(output_step) - 2 * depth;
         bool shrink_west = get<2>(input_step) != get<2>(output_step) - 2 * depth;
         bool shrink_south = get<5>(input_step) != get<5>(output_step) + 2 * depth;
-        int output_dims_y = ((input_grid.size() - 1) * 2) - (shrink_north ? 1 : 0) - (shrink_south ? 1 : 0);
-        int output_dims_x = ((input_grid[0].size() - 1) * 2) - (shrink_east ? 1 : 0) - (shrink_west ? 1 : 0);
+        size_t output_dims_y = ((input_grid.size() - 1) * 2) - (shrink_north ? 1 : 0) - (shrink_south ? 1 : 0);
+        size_t output_dims_x = ((input_grid[0].size() - 1) * 2) - (shrink_east ? 1 : 0) - (shrink_west ? 1 : 0);
 
         // create a first auxillary grid (one unit wider and taller than the output)
         vector<vector<quad*>> aux_grid(output_dims_y + 1, vector<quad*>(output_dims_x + 1, nullptr));
@@ -380,8 +376,8 @@ public:
         bool shrink_north = get<3>(input_step) != get<3>(output_step);
         bool shrink_west = get<2>(input_step) != get<2>(output_step);
         bool shrink_south = get<5>(input_step) != get<5>(output_step);
-        int output_dims_y = (input_grid.size() * 2) - (shrink_north ? 1 : 0) - (shrink_south ? 1 : 0);
-        int output_dims_x = (input_grid[0].size() * 2) - (shrink_east ? 1 : 0) - (shrink_west ? 1 : 0);
+        size_t output_dims_y = (input_grid.size() * 2) - (shrink_north ? 1 : 0) - (shrink_south ? 1 : 0);
+        size_t output_dims_x = (input_grid[0].size() * 2) - (shrink_east ? 1 : 0) - (shrink_west ? 1 : 0);
 
         // construct the output grid using children of the macrocells in the input grid
         vector<vector<quad*>> output_grid(output_dims_y, vector<quad*>(output_dims_x, nullptr));
@@ -568,7 +564,7 @@ public:
         }
 
         // perform the steps that we planned out, from the back of the vector to the front
-        for (int i = steps.size() - 1; i > 0; i--) {
+        for (size_t i = steps.size() - 1; i > 0; i--) {
             if (get<0>(steps[i]) != get<0>(steps[i-1])) {
                 result = expand_result(result, steps[i], steps[i-1]);
             } else {
@@ -615,7 +611,7 @@ public:
         auto nw_grid = expand_quad(input->nw);
         auto sw_grid = expand_quad(input->sw);
         auto se_grid = expand_quad(input->se);
-        int half_size = ne_grid.size();
+        size_t half_size = ne_grid.size();
         vector<vector<bool>> result(2 * half_size, vector<bool>(2 * half_size));
         for (int i = 0; i < half_size; ++i) {
             for (int j = 0; j < half_size; ++j) {
@@ -699,10 +695,20 @@ int main() {
     // hashlife::print_grid(my_hashlife.expand_quad(my_result));
 
     // render some viewports
-    for (int i = 0; i < 2000; i++) {
-        hashlife::print_grid(my_hashlife.show_viewport(i, -51, -28, 52, 29));
-        usleep(50000);
+    int cnt = 0;
+    quad* old = 0;
+    for (int i = 0; i < 1200; i++) {
+        true ? my_hashlife.show_viewport(i, -51, -28, 52, 29) : hashlife::print_grid(my_hashlife.show_viewport(i, -51, -28, 52, 29));
+        if (my_hashlife.top_quad == old) {
+            ++cnt;
+        }
+        else {
+            old = my_hashlife.top_quad;
+            std::cout << old << " appeared " << cnt << " times." << std::endl;
+            cnt = 1;
+        }
     }
+    std::cout << old << " appeared " << cnt << " times." << std::endl;
 
     return 0;
 }
