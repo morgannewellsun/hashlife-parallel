@@ -1,5 +1,7 @@
 #define IS_POWER_OF_TWO(x) ((x) > 0 && ((x) & ((x) - 1)) == 0)
 // #define ENABLE_VISUAL
+#define ENABLE_VERBOSE
+#define ENABLE_TIMING 1 // undefined for no timing, 1 for high-level timing (negligible performance impact), 2 for low-level timing (high performance impact)
 
 #include <chrono>
 #include <cmath>
@@ -13,6 +15,38 @@
 #endif
 
 using namespace std;
+using namespace chrono;
+
+// patterns
+enum pattern
+{
+    nothing,
+    r_pentomino,
+    glider,
+    lightweight_spaceship,
+    twenty_cell_quadratic_growth,
+    methuselahs_126932979M,
+    lidka,
+};
+
+// pattern to simulate
+constexpr auto pattern = lidka;
+
+// viewport parameters
+constexpr int viewport_half_height = 100;
+constexpr int viewport_half_width = 400;
+constexpr int n_timesteps = 20000;
+
+// timers
+#ifdef ENABLE_TIMING
+high_resolution_clock::duration duration_viewports = high_resolution_clock::duration::zero();
+high_resolution_clock::duration duration_rehashing = high_resolution_clock::duration::zero();
+high_resolution_clock::duration durations_show_viewports;  // an extra space to dump time that we don't want to count 
+high_resolution_clock::duration durations_show_viewports_planning;
+high_resolution_clock::duration durations_show_viewports_solution;
+high_resolution_clock::duration durations_show_viewports_output;
+high_resolution_clock::duration durations_hashmap;
+#endif
 
 int round_two(int number, int exponent, bool round_up) {
     // round number up or down to the nearest 2^exponent
@@ -66,7 +100,14 @@ size_t quad_hash(quad* ne, quad* nw, quad* sw, quad* se) {
     return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3);
 }
 
-class serial_hashmap {
+class concurrent_hashmap {
+    // a rather "dumb" concurrent hashmap datastructure
+    // it only supports a single get_or_insert operation
+    // it uses linear probing for collision resolution
+    // it tells you when it needs to be rehashed (>=0.7 load factor in any shard)
+    // get_or_construct() is meant to be used by many concurrent threads
+    // rehash() is meant to be called outside a parallel block, and handles concurrency itself
+    // to avoid deadlocks, make sure there are many more shards compared to threads
 public:
 
     // constants
@@ -74,36 +115,38 @@ public:
     int capacity;
     int rehash_threshold;
 
-    int size;
     bool rehash_needed;
     tuple<quad*, quad*, quad*, quad*, quad*, size_t>** buckets;
+    int size;
 
-    serial_hashmap(int log_capacity) {
+    concurrent_hashmap(int log_capacity) {
+
+        // if (log_capacity <= log_n_shards) {
+        //     cout << "log_capacity (" << log_capacity << ") must be greater than log_n_shards (" << log_n_shards << ")." << endl;
+        //     throw;
+        // }
 
         this->log_capacity = log_capacity;
         capacity = 1 << log_capacity;
         rehash_threshold = 1 << (log_capacity - 1);
 
-        size = 0;
         rehash_needed = false;
         buckets = new tuple<quad*, quad*, quad*, quad*, quad*, size_t>*[capacity]();
+        size = 0;
     }
 
-    ~serial_hashmap() {
-        // tuples are reused in the rehashed hashmap, so don't delete them
-        // this probably violates some programming principles regarding memory management
-        // for (int i = 0; i < capacity; ++i) {
-        //     if (buckets[i] != nullptr) {
-        //         delete buckets[i];
-        //     }
-        // }
+    ~concurrent_hashmap() {
         delete[] buckets;
     }
 
-    serial_hashmap(serial_hashmap&&) = delete;
-    serial_hashmap& operator=(serial_hashmap&&) = delete;
+    concurrent_hashmap(concurrent_hashmap&&) = delete;
+    concurrent_hashmap& operator=(concurrent_hashmap&&) = delete;
 
     quad* get_or_construct(quad* ne, quad* nw, quad* sw, quad* se) {
+
+#if ENABLE_TIMING >= 2
+        auto hash_start = high_resolution_clock::now();
+#endif
         size_t hash_value = quad_hash(ne, nw, sw, se);
         int bucket_index = hash_value % capacity;  // hash_value & (capacity - 1);
         int first_bucket_index = bucket_index;
@@ -127,20 +170,25 @@ public:
                 break;
             } else {
                 // hash collision; continue linearly probing, switching locks if necessary
-                bucket_index = (bucket_index + 1) % capacity;  // (bucket_index + 1) % capacity;
+                bucket_index = (bucket_index + 1) % capacity;  // (bucket_index + 1) & (capacity - 1);
                 if (bucket_index == first_bucket_index) {
                     cout << "Attempted to construct and insert a new item, but all hashmap shards were full. This is fatal."  << endl;
                     throw;
                 }
             }
         }
+#if ENABLE_TIMING >= 2
+        auto hash_end = high_resolution_clock::now();
+        durations_hashmap += hash_end - hash_start;
+#endif
         return ptr_to_return;
     }
 
-    static serial_hashmap* rehash(serial_hashmap* old_hashmap) {
-        // constructs a rehashed version the old hashmap
+    static concurrent_hashmap* rehash(concurrent_hashmap* old_hashmap) {
+        // constructs a rehashed version the old hashmap using multiple threads
         // caller is responsible for managing deletion of both the old and new hashmap
-        serial_hashmap* new_hashmap = new serial_hashmap(old_hashmap->log_capacity + 1);
+        // caller is responsible for ensuring that this is called when no writes to the old hashmap are active
+        concurrent_hashmap* new_hashmap = new concurrent_hashmap(old_hashmap->log_capacity + 1);
         for (int i = 0; i < old_hashmap->capacity; ++i) {
             if (old_hashmap->buckets[i] != nullptr) {
                 new_hashmap->rehash_insert(old_hashmap->buckets[i]);
@@ -172,9 +220,9 @@ private:
                 throw;
             } else {
                 // hash collision; continue linearly probing, switching locks if necessary
-                bucket_index = (bucket_index + 1) % capacity;  // (bucket_index + 1) % capacity;
+                bucket_index = (bucket_index + 1) % capacity; // (bucket_index + 1) % capacity;
                 if (bucket_index == first_bucket_index) {
-                    cout << "Attempted to construct and insert a new item, but all hashmap shards were full. This is fatal."  << endl;
+                    cout << "During rehashing, attempted to insert an item, but all hashmap shards were full. This is fatal."  << endl;
                     throw;
                 }
             }
@@ -187,7 +235,7 @@ public:
     bool initialized = false;
     quad* dead_cell = new quad();
     quad* live_cell = new quad();
-    serial_hashmap* hashmap;
+    concurrent_hashmap* hashmap;
     quad* top_quad;
     vector<quad*> dead_quads = {dead_cell};
 
@@ -201,7 +249,7 @@ public:
         initialized = true;
 
         // create the hashmap
-        hashmap = new serial_hashmap(18);
+        hashmap = new concurrent_hashmap(18);
 
         // enumerate both (1x1) macrocells; these aren't memoized
         quad* quads_1x1[] = {dead_cell, live_cell};
@@ -377,7 +425,7 @@ public:
         top_quad = hashmap->get_or_construct(new_ne, new_nw, new_sw, new_se);
     }
 
-    vector<vector<quad*>> expand_result(vector<vector<quad*>> input_grid, tuple<int, int, int, int, int, int> input_step, tuple<int, int, int, int, int, int> output_step) {
+    vector<vector<quad*>> expand_result(vector<vector<quad*>> input_grid, tuple<int, int, int, int, int, int> input_step, tuple<int, int, int, int, int, int> output_step) { 
         // macrocell size gets cut in half; time increases by half of the output macrocell sidelength
 
         int depth = 1 << (get<1>(output_step) - 1);
@@ -503,6 +551,11 @@ public:
     }
 
     vector<vector<bool>>* show_viewport(int time, int x_min, int y_min, int x_max, int y_max) {
+        // thread_index is just for doing timing profiling and isn't necessary for the actual algorithm
+
+#ifdef ENABLE_TIMING
+        auto planning_start = high_resolution_clock::now();
+#endif
         
         // decompose the problem into a vector of intermediate steps, each of which is a grid of macrocells that must be found
         vector<tuple<int, int, int, int, int, int>> steps;  // [time, size, x_min, y_min, x_max, y_max]
@@ -599,7 +652,7 @@ public:
                     round_two(get<5>(steps.back()), next_size, true)});
             }
         }
-        
+
         // ensure our top quad is large enough to proceed and apply padding if not
         while (get<1>(steps.back()) > top_quad->log_size - 1) {
             pad_top_quad();
@@ -633,6 +686,12 @@ public:
             }
         }
 
+#ifdef ENABLE_TIMING
+        auto planning_end = high_resolution_clock::now();
+        durations_show_viewports_planning += planning_end - planning_start;
+        auto solution_start = high_resolution_clock::now();
+#endif
+
         // perform the steps that we planned out, from the back of the vector to the front
         for (int i = steps.size() - 1; i > 0; i--) {
             if (get<0>(steps[i]) != get<0>(steps[i-1])) {
@@ -642,6 +701,12 @@ public:
             }
         }
 
+#ifdef ENABLE_TIMING
+        auto solution_end = high_resolution_clock::now();
+        durations_show_viewports_solution += solution_end - solution_start;
+        auto output_start = high_resolution_clock::now();
+#endif
+
         // convert result to a grid of booleans
         vector<vector<bool>>* result_bool = new vector<vector<bool>>(result.size(), vector<bool>(result[0].size()));
         for (int i = 0; i < result.size(); ++i) {
@@ -649,19 +714,28 @@ public:
                 (*result_bool)[i][j] = result[i][j] == live_cell;
             }
         }
+
+#ifdef ENABLE_TIMING
+        auto output_end = high_resolution_clock::now();
+        durations_show_viewports_output += output_end - output_start;
+#endif
+
         return result_bool;
     }
 
     void rehash() {
-        serial_hashmap* new_hashmap = serial_hashmap::rehash(hashmap);
+        concurrent_hashmap* new_hashmap = concurrent_hashmap::rehash(hashmap);
         delete hashmap;
         hashmap = new_hashmap;
     }
 
     static void print_grid(const vector<vector<bool>>& grid) {
-        std::cout << '|';
-        for (size_t i = 0; i < grid[0].size(); ++i) std::cout << '-';
-        std::cout << '|' << std::endl;
+        // std::cout << '|';
+        // for (size_t i = 0; i < grid[0].size(); ++i) std::cout << '-';
+        // std::cout << '|' << std::endl;
+        std::cout << '-';
+        for (size_t i = 0; i < grid[0].size(); ++i) std::cout << ' ';
+        std::cout << '-' << std::endl;
         for (const auto& row : grid) {
             std::cout << '|';
             for (bool cell : row) {
@@ -669,9 +743,9 @@ public:
             }
             std::cout << '|' << std::endl;
         }
-        std::cout << '|';
-        for (size_t i = 0; i < grid[0].size(); ++i) std::cout << '-';
-        std::cout << '|' << std::endl;
+        // std::cout << '|';
+        // for (size_t i = 0; i < grid[0].size(); ++i) std::cout << '-';
+        // std::cout << '|' << std::endl;
     }
 
     // vector<vector<bool>> expand_quad(quad* input) {
@@ -703,89 +777,253 @@ public:
 
 int main() {
 
-    // empty grid
-    int initial_state_sidelength = 256;
-    int middle = initial_state_sidelength / 2;
-    vector<vector<bool>> initial_state(initial_state_sidelength, vector<bool>(initial_state_sidelength, false));
+    vector<vector<bool>> initial_state;
+    int x_center;
+    int y_center;
+    int period;
+    int x_speed;
+    int y_speed;
 
-    // r-pentomino
-    // initial_state[middle - 1][middle    ] = true;
-    // initial_state[middle    ][middle - 1] = true;
-    // initial_state[middle    ][middle    ] = true;
-    // initial_state[middle + 1][middle    ] = true;
-    // initial_state[middle + 1][middle + 1] = true;
+    if (pattern == nothing) {
+        int initial_state_sidelength = 16;
+        int middle = initial_state_sidelength / 2;
+        initial_state = vector<vector<bool>>(initial_state_sidelength, vector<bool>(initial_state_sidelength, false));
+        x_center = 0;
+        y_center = 0;
+        period = 1;
+        x_speed = 0;
+        y_speed = 0;
 
-    // // glider
-    // initial_state[middle - 1][middle - 1] = true;
-    // initial_state[middle - 1][middle    ] = true;
-    // initial_state[middle - 1][middle + 1] = true;
-    // initial_state[middle    ][middle + 1] = true;
-    // initial_state[middle + 1][middle    ] = true;
+    } else if (pattern == r_pentomino) {
+        int initial_state_sidelength = 16;
+        int middle = initial_state_sidelength / 2;
+        initial_state = vector<vector<bool>>(initial_state_sidelength, vector<bool>(initial_state_sidelength, false));
+        initial_state[middle - 1][middle    ] = true;
+        initial_state[middle    ][middle - 1] = true;
+        initial_state[middle    ][middle    ] = true;
+        initial_state[middle + 1][middle    ] = true;
+        initial_state[middle + 1][middle + 1] = true;
+        x_center = 0;
+        y_center = 0;
+        period = 1;
+        x_speed = 0;
+        y_speed = 0;
 
-    // // lighweight spaceship
-    // initial_state[middle - 1][middle - 1] = true;
-    // initial_state[middle - 1][middle] = true;
-    // initial_state[middle - 1][middle + 1] = true;
-    // initial_state[middle - 1][middle + 2] = true;
-    // initial_state[middle    ][middle - 1] = true;
-    // initial_state[middle    ][middle + 3] = true;
-    // initial_state[middle + 1][middle - 1] = true;
-    // initial_state[middle + 2][middle    ] = true;
-    // initial_state[middle + 2][middle + 3] = true; 
+    } else if (pattern == glider) {
+        int initial_state_sidelength = 16;
+        int middle = initial_state_sidelength / 2;
+        initial_state = vector<vector<bool>>(initial_state_sidelength, vector<bool>(initial_state_sidelength, false));
+        initial_state[middle - 1][middle - 1] = true;
+        initial_state[middle - 1][middle    ] = true;
+        initial_state[middle - 1][middle + 1] = true;
+        initial_state[middle    ][middle + 1] = true;
+        initial_state[middle + 1][middle    ] = true;
+        x_center = 0;
+        y_center = 0;
+        period = 4;
+        x_speed = 1;
+        y_speed = -1;
 
-    // 20-cell quadratic growth
-    initial_state[middle + 32][middle     ] = true;
-    initial_state[middle + 30][middle +  1] = true;
-    initial_state[middle + 31][middle +  1] = true;
-    initial_state[middle + 29][middle +  2] = true;
-    initial_state[middle + 32][middle +  2] = true;
-    initial_state[middle + 28][middle +  3] = true;
-    initial_state[middle + 28][middle +  5] = true;
-    initial_state[middle + 28][middle +  6] = true;
-    initial_state[middle + 29][middle +  6] = true;
-    initial_state[middle +  8][middle + 88] = true;
-    initial_state[middle +  8][middle + 89] = true;
-    initial_state[middle +  8][middle + 90] = true;
-    initial_state[middle +  1][middle + 92] = true;
-    initial_state[middle +  0][middle + 94] = true;
-    initial_state[middle +  1][middle + 94] = true;
-    initial_state[middle +  2][middle + 94] = true;
-    initial_state[middle +  2][middle + 95] = true;
-    initial_state[middle + 20][middle + 95] = true;
-    initial_state[middle + 19][middle + 96] = true;
-    initial_state[middle + 20][middle + 96] = true;
+    } else if (pattern == lightweight_spaceship) {
+        int initial_state_sidelength = 16;
+        int middle = initial_state_sidelength / 2;
+        initial_state = vector<vector<bool>>(initial_state_sidelength, vector<bool>(initial_state_sidelength, false));
+        initial_state[middle - 1][middle - 1] = true;
+        initial_state[middle - 1][middle] = true;
+        initial_state[middle - 1][middle + 1] = true;
+        initial_state[middle - 1][middle + 2] = true;
+        initial_state[middle    ][middle - 1] = true;
+        initial_state[middle    ][middle + 3] = true;
+        initial_state[middle + 1][middle - 1] = true;
+        initial_state[middle + 2][middle    ] = true;
+        initial_state[middle + 2][middle + 3] = true; 
+        x_center = 0;
+        y_center = 0;
+        period = 4;
+        x_speed = -2;
+        y_speed = 0;
+
+    } else if (pattern == twenty_cell_quadratic_growth) {
+        int initial_state_sidelength = 256;
+        int middle = initial_state_sidelength / 2;
+        initial_state = vector<vector<bool>>(initial_state_sidelength, vector<bool>(initial_state_sidelength, false));
+        initial_state[middle + 32][middle     ] = true;
+        initial_state[middle + 30][middle +  1] = true;
+        initial_state[middle + 31][middle +  1] = true;
+        initial_state[middle + 29][middle +  2] = true;
+        initial_state[middle + 32][middle +  2] = true;
+        initial_state[middle + 28][middle +  3] = true;
+        initial_state[middle + 28][middle +  5] = true;
+        initial_state[middle + 28][middle +  6] = true;
+        initial_state[middle + 29][middle +  6] = true;
+        initial_state[middle +  8][middle + 88] = true;
+        initial_state[middle +  8][middle + 89] = true;
+        initial_state[middle +  8][middle + 90] = true;
+        initial_state[middle +  1][middle + 92] = true;
+        initial_state[middle +  0][middle + 94] = true;
+        initial_state[middle +  1][middle + 94] = true;
+        initial_state[middle +  2][middle + 94] = true;
+        initial_state[middle +  2][middle + 95] = true;
+        initial_state[middle + 20][middle + 95] = true;
+        initial_state[middle + 19][middle + 96] = true;
+        initial_state[middle + 20][middle + 96] = true;
+        x_center = 0;
+        y_center = 0;
+        period = 11136;
+        x_speed = 11136 / 12;
+        y_speed = 11136 / 12;
+
+    } else if (pattern == methuselahs_126932979M) {
+        int initial_state_sidelength = 64;
+        int middle = initial_state_sidelength / 2;
+        initial_state = vector<vector<bool>>(initial_state_sidelength, vector<bool>(initial_state_sidelength, false));
+        initial_state[middle     ][middle + 11] = true;
+        initial_state[middle     ][middle + 13] = true;
+        initial_state[middle +  1][middle + 10] = true;
+        initial_state[middle +  2][middle + 11] = true;
+        initial_state[middle +  2][middle + 14] = true;
+        initial_state[middle +  3][middle + 13] = true;
+        initial_state[middle +  3][middle + 14] = true;
+        initial_state[middle +  3][middle + 15] = true;
+        initial_state[middle +  5][middle +  2] = true;
+        initial_state[middle +  6][middle     ] = true;
+        initial_state[middle +  7][middle +  2] = true;
+        initial_state[middle +  8][middle     ] = true;
+        initial_state[middle +  9][middle +  2] = true;
+        initial_state[middle + 10][middle +  2] = true;
+        initial_state[middle + 11][middle +  3] = true;
+        initial_state[middle + 11][middle +  5] = true;
+        initial_state[middle + 12][middle +  5] = true;
+        initial_state[middle + 16][middle + 18] = true;
+        initial_state[middle + 16][middle + 19] = true;
+        initial_state[middle + 16][middle + 20] = true;
+        initial_state[middle + 18][middle + 14] = true;
+        initial_state[middle + 18][middle + 15] = true;
+        initial_state[middle + 19][middle + 12] = true;
+        initial_state[middle + 19][middle + 15] = true;
+        initial_state[middle + 21][middle + 12] = true;
+        initial_state[middle + 21][middle + 14] = true;
+        initial_state[middle + 22][middle + 13] = true;
+        x_center = 0;
+        y_center = 0;
+        period = 1;
+        x_speed = 0;
+        y_speed = 0;
+
+    } else if (pattern == lidka) {
+        int initial_state_sidelength = 32;
+        int middle = initial_state_sidelength / 2;
+        initial_state = vector<vector<bool>>(initial_state_sidelength, vector<bool>(initial_state_sidelength, false));
+        initial_state[middle     ][middle +  1] = true;
+        initial_state[middle +  1][middle     ] = true;
+        initial_state[middle +  1][middle +  2] = true;
+        initial_state[middle +  2][middle +  1] = true;
+        initial_state[middle +  4][middle + 14] = true;
+        initial_state[middle +  5][middle + 12] = true;
+        initial_state[middle +  5][middle + 14] = true;
+        initial_state[middle +  6][middle + 11] = true;
+        initial_state[middle +  6][middle + 12] = true;
+        initial_state[middle +  6][middle + 14] = true;
+        initial_state[middle +  8][middle + 10] = true;
+        initial_state[middle +  8][middle + 11] = true;
+        initial_state[middle +  8][middle + 12] = true;
+        x_center = 0;
+        y_center = 0;
+        period = 1;
+        x_speed = 0;
+        y_speed = 0;
+    }
 
     // initialization
+    cout << "Starting." << endl;
     hashlife my_hashlife(initial_state);
-
-    // viewport parameters
-    int n_timesteps = 200000;
-    int x_padding = 96;
-    int y_padding = 19;
-    int x_min = 0 - x_padding;
-    int y_min = 0 - y_padding;
-    int x_max = 97 + x_padding;
-    int y_max = 33 + y_padding;
 
     // render some viewports
     vector<vector<vector<bool>>*> viewports(n_timesteps, nullptr); 
-    auto start = chrono::system_clock::now();
-    for (int i = 0; i < n_timesteps; i++) {
+#ifdef ENABLE_TIMING
+    auto wall_clock_start = high_resolution_clock::now();
+#endif
+    for(int curr_timestep = 0; curr_timestep <= n_timesteps; curr_timestep++) {
+
+
+
         if (my_hashlife.hashmap->rehash_needed) {
+#ifdef ENABLE_TIMING
+            auto rehashing_start = high_resolution_clock::now();
+#endif
+#ifdef ENABLE_VERBOSE
+            cout << "Rehashing to a hashmap with capacity " << (1 << my_hashlife.hashmap->log_capacity) << "." << endl; 
+#endif
             my_hashlife.rehash();
+#ifdef ENABLE_TIMING
+            auto rehashing_end = high_resolution_clock::now();
+            duration_rehashing += rehashing_end - rehashing_start;
+#endif
         }
-        viewports[i] = my_hashlife.show_viewport(i, x_min, y_min, x_max, y_max);
+
+
+
+        int x_min = (x_center - viewport_half_width) + (x_speed * curr_timestep / period);
+        int y_min = (y_center - viewport_half_height) + (y_speed * curr_timestep / period);
+        int x_max = (x_center + viewport_half_width) + (x_speed * curr_timestep / period);
+        int y_max = (y_center + viewport_half_height) + (y_speed * curr_timestep / period);
+#ifdef ENABLE_TIMING
+        auto viewports_start = high_resolution_clock::now();
+#endif
+        viewports[curr_timestep] = my_hashlife.show_viewport(curr_timestep, x_min, y_min, x_max, y_max);
+#ifdef ENABLE_TIMING
+        auto viewports_end = high_resolution_clock::now();
+        duration_viewports += viewports_end - viewports_start;
+#endif
     }
-    auto end = chrono::system_clock::now();
-    chrono::duration<double> elapsed_seconds = end - start;
-    cout << "Computation took " << elapsed_seconds.count() << " wall-clock seconds." << endl;
+
+#ifdef ENABLE_TIMING
+    auto wall_clock_end = high_resolution_clock::now();
+
+    // report timings
+    auto total_durations_show_viewports_planning = durations_show_viewports_planning;
+    auto total_durations_show_viewports_solution = durations_show_viewports_solution;
+    auto total_durations_show_viewports_output = durations_show_viewports_output;
+    auto total_durations_hashmap = durations_hashmap;
+    high_resolution_clock::duration wall_clock_total = wall_clock_end - wall_clock_start;
+    high_resolution_clock::duration task_management_overhead = wall_clock_total - (duration_viewports + duration_rehashing);
+    
+    cout << endl << "--- Wall-Clock Time Statistics ---" << endl;
+    cout << "Whole computation took " << duration_cast<nanoseconds>(wall_clock_total).count() * 1e-9 << " seconds." << endl;
+#if ENABLE_TIMING == 1
+    cout << "Viewport calculation took " << duration_cast<nanoseconds>(duration_viewports).count() * 1e-9 << " seconds." << endl;
+    cout << "\tThis is " << 100. * duration_viewports / wall_clock_total << "% of the total time." << endl;
+    cout << "Rehashing operations took " << duration_cast<nanoseconds>(duration_rehashing).count() * 1e-9 << " seconds." << endl;
+    cout << "\tThis is " << 100. * duration_rehashing / wall_clock_total << "% of the total time." << endl;
+    cout << "This leaves a discreptancy (mostly due to parallelism overhead) of " << duration_cast<nanoseconds>(task_management_overhead).count() * 1e-9 << " seconds." << endl;
+    cout << "\tThis is " << 100. * task_management_overhead / wall_clock_total << "% of the total time." << endl;
+
+    cout << endl << "--- hashlife::show_viewport() Thread Work Statistics --" << endl;
+    cout << "Planning part of show_viewport() took up a total of " << duration_cast<nanoseconds>(total_durations_show_viewports_planning).count() * 1e-9 << " thread-seconds." << endl;
+    cout << "\tThis is " << 100. * total_durations_show_viewports_planning / duration_viewports << "% of the work in show_viewport()." << endl;
+    cout << "\tThis is an average of " << duration_cast<nanoseconds>(total_durations_show_viewports_planning).count() * 1e-9 << " seconds per thread." << endl;
+    cout << "Solution part of show_viewport() took up a total of " << duration_cast<nanoseconds>(total_durations_show_viewports_solution).count() * 1e-9 << " thread-seconds." << endl;
+    cout << "\tThis is " << 100. * total_durations_show_viewports_solution / duration_viewports << "% of the work in show_viewport()." << endl;
+    cout << "\tThis is an average of " << duration_cast<nanoseconds>(total_durations_show_viewports_solution).count() * 1e-9 << " seconds per thread." << endl;
+    cout << "Output part of show_viewport() took up a total of " << duration_cast<nanoseconds>(total_durations_show_viewports_output).count() * 1e-9 << " thread-seconds." << endl;
+    cout << "\tThis is " << 100. * total_durations_show_viewports_output / duration_viewports << "% of the work in show_viewport()." << endl;
+    cout << "\tThis is an average of " << duration_cast<nanoseconds>(total_durations_show_viewports_output).count() * 1e-9 << " seconds per thread." << endl;
+#endif
+
+#if ENABLE_TIMING >= 2
+    cout << endl << "--- concurrent_hashmap::get_or_construct() Thread Work Statistics --" << endl;
+    cout << "During show_viewport() calls, get_or_construct() took up a total of " << duration_cast<nanoseconds>(total_durations_hashmap).count() * 1e-9 << " thread-seconds." << endl;
+#endif
+
+    cout << endl;
+#endif
 
 #ifdef ENABLE_VISUAL
-    usleep(5000000);
+    usleep(2000000);
     for (int i = 0; i < n_timesteps; ++i) {
         hashlife::print_grid(*viewports[i]);
         delete viewports[i];
-        usleep(50000);
+        usleep(10000);
     }
 #endif
 
