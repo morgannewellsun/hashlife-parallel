@@ -1,7 +1,7 @@
 #define IS_POWER_OF_TWO(x) ((x) > 0 && ((x) & ((x) - 1)) == 0)
 // #define ENABLE_VISUAL
 #define ENABLE_VERBOSE
-#define ENABLE_TIMING 1 // undefined for no timing, 1 for high-level timing (negligible performance impact), 2 for low-level timing (high performance impact)
+// #define ENABLE_TIMING 1 // undefined for no timing, 1 for high-level timing (negligible performance impact), 2 for low-level timing (high performance impact)
 
 #include <chrono>
 #include <cmath>
@@ -30,7 +30,7 @@ enum pattern
 };
 
 // pattern to simulate
-constexpr auto pattern = lidka;
+constexpr auto pattern = twenty_cell_quadratic_growth;
 
 // viewport parameters
 constexpr int viewport_half_height = 100;
@@ -940,9 +940,7 @@ int main() {
 
     // render some viewports
     vector<vector<vector<bool>>*> viewports(n_timesteps, nullptr); 
-#ifdef ENABLE_TIMING
     auto wall_clock_start = high_resolution_clock::now();
-#endif
     for(int curr_timestep = 0; curr_timestep <= n_timesteps; curr_timestep++) {
 
 
@@ -976,20 +974,23 @@ int main() {
         duration_viewports += viewports_end - viewports_start;
 #endif
     }
-
-#ifdef ENABLE_TIMING
     auto wall_clock_end = high_resolution_clock::now();
 
+    high_resolution_clock::duration wall_clock_total = wall_clock_end - wall_clock_start;
+    cout << endl << "--- Wall-Clock Time Statistics ---" << endl;
+    cout << "Whole computation took " << duration_cast<nanoseconds>(wall_clock_total).count() * 1e-9 << " seconds." << endl;
+
+#ifdef ENABLE_TIMING
+    
     // report timings
     auto total_durations_show_viewports_planning = durations_show_viewports_planning;
     auto total_durations_show_viewports_solution = durations_show_viewports_solution;
     auto total_durations_show_viewports_output = durations_show_viewports_output;
     auto total_durations_hashmap = durations_hashmap;
-    high_resolution_clock::duration wall_clock_total = wall_clock_end - wall_clock_start;
+    auto total_vp = total_durations_show_viewports_planning + total_durations_show_viewports_solution + total_durations_show_viewports_output;
     high_resolution_clock::duration task_management_overhead = wall_clock_total - (duration_viewports + duration_rehashing);
     
-    cout << endl << "--- Wall-Clock Time Statistics ---" << endl;
-    cout << "Whole computation took " << duration_cast<nanoseconds>(wall_clock_total).count() * 1e-9 << " seconds." << endl;
+
 #if ENABLE_TIMING == 1
     cout << "Viewport calculation took " << duration_cast<nanoseconds>(duration_viewports).count() * 1e-9 << " seconds." << endl;
     cout << "\tThis is " << 100. * duration_viewports / wall_clock_total << "% of the total time." << endl;
@@ -1000,13 +1001,13 @@ int main() {
 
     cout << endl << "--- hashlife::show_viewport() Thread Work Statistics --" << endl;
     cout << "Planning part of show_viewport() took up a total of " << duration_cast<nanoseconds>(total_durations_show_viewports_planning).count() * 1e-9 << " thread-seconds." << endl;
-    cout << "\tThis is " << 100. * total_durations_show_viewports_planning / duration_viewports << "% of the work in show_viewport()." << endl;
+    cout << "\tThis is " << 100. * total_durations_show_viewports_planning / total_vp << "% of the work in show_viewport()." << endl;
     cout << "\tThis is an average of " << duration_cast<nanoseconds>(total_durations_show_viewports_planning).count() * 1e-9 << " seconds per thread." << endl;
     cout << "Solution part of show_viewport() took up a total of " << duration_cast<nanoseconds>(total_durations_show_viewports_solution).count() * 1e-9 << " thread-seconds." << endl;
-    cout << "\tThis is " << 100. * total_durations_show_viewports_solution / duration_viewports << "% of the work in show_viewport()." << endl;
+    cout << "\tThis is " << 100. * total_durations_show_viewports_solution / total_vp << "% of the work in show_viewport()." << endl;
     cout << "\tThis is an average of " << duration_cast<nanoseconds>(total_durations_show_viewports_solution).count() * 1e-9 << " seconds per thread." << endl;
     cout << "Output part of show_viewport() took up a total of " << duration_cast<nanoseconds>(total_durations_show_viewports_output).count() * 1e-9 << " thread-seconds." << endl;
-    cout << "\tThis is " << 100. * total_durations_show_viewports_output / duration_viewports << "% of the work in show_viewport()." << endl;
+    cout << "\tThis is " << 100. * total_durations_show_viewports_output / total_vp << "% of the work in show_viewport()." << endl;
     cout << "\tThis is an average of " << duration_cast<nanoseconds>(total_durations_show_viewports_output).count() * 1e-9 << " seconds per thread." << endl;
 #endif
 
